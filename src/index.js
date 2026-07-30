@@ -1,6 +1,6 @@
 /**
  * StreamVault Multi-Provider Resolver & Edge Stream Proxy Engine
- * Cloudflare Worker Service — Featuring TMDB->IMDb Auto-Lookup & 16-Scraper Suite
+ * Cloudflare Worker Service — Direct Native HLS/MP4 Extractor Suite
  */
 
 const CORS_HEADERS = {
@@ -121,15 +121,13 @@ export default {
       );
     }
 
-    // 🔍 AUTO-RESOLVE IMDb ID FROM TMDB ID IF MISSING
+    // Auto-resolve IMDb ID if missing
     if (!imdbId && tmdbId) {
       try {
         const extRes = await fetchWithTimeout(`https://db.speedracelight.com/3/${type}/${tmdbId}/external_ids?language=en-US`, {}, 2000);
         if (extRes && extRes.ok) {
           const extData = await extRes.json();
-          if (extData && extData.imdb_id) {
-            imdbId = extData.imdb_id;
-          }
+          if (extData && extData.imdb_id) imdbId = extData.imdb_id;
         }
       } catch (e) {}
     }
@@ -140,7 +138,7 @@ export default {
       return `${url.origin}/hls-proxy?url=${encodeURIComponent(targetUrl)}&referer=${encodeURIComponent(referer)}`;
     };
 
-    // 1. XPass
+    // ─── 1. XPass Direct HLS Extractor ───
     const getXPass = async () => {
       const searchId = imdbId || tmdbId;
       if (!searchId) return;
@@ -172,7 +170,7 @@ export default {
                     provider: 'XPass Direct HLS',
                     quality: '1080p HD (Direct HLS)',
                     url: makeProxyUrl(hlsSource.file, 'https://play.xpass.top/'),
-                    isEmbed: false
+                    isEmbed: false // 🎯 OUR NATIVE PLAYER!
                   });
                   return;
                 }
@@ -190,7 +188,7 @@ export default {
       });
     };
 
-    // 2. VixSrc
+    // ─── 2. VixSrc Direct HLS Extractor (REVERSE-ENGINEERED) ───
     const getVixSrc = async () => {
       if (!tmdbId) return;
       try {
@@ -205,33 +203,30 @@ export default {
         if (res && res.ok) {
           const data = await res.json();
           if (data && data.src) {
-            const embedPage = `https://vixsrc.to${data.src}`;
-            const embedRes = await fetchWithTimeout(embedPage, {
-              headers: { 'Referer': `https://vixsrc.to/${type}/${tmdbId}` }
-            });
+            // Convert /embed/{id}?token=... into /playlist/{id}?type=video&rendition=1080p&token=...
+            const srcPath = data.src;
+            const embedIdMatch = srcPath.match(/\/embed\/(\d+)/);
+            if (embedIdMatch) {
+              const embedId = embedIdMatch[1];
+              const queryString = srcPath.includes('?') ? srcPath.split('?')[1] : '';
+              const directHlsUrl = `https://vixsrc.to/playlist/${embedId}?type=video&rendition=1080p&${queryString}`;
 
-            if (embedRes && embedRes.ok) {
-              const embedHtml = await embedRes.text();
-              const playlistMatch = embedHtml.match(/playlist\/(\d+)\?type=video[^"']*/);
-              if (playlistMatch) {
-                const playlistUrl = `https://vixsrc.to/${playlistMatch[0]}`;
-                sources.push({
-                  provider: 'VixSrc Direct HLS',
-                  quality: 'VixCloud 1080p (Direct HLS)',
-                  url: makeProxyUrl(playlistUrl, 'https://vixsrc.to/'),
-                  isEmbed: false
-                });
-                return;
-              }
+              sources.push({
+                provider: 'VixSrc Direct HLS',
+                quality: 'VixCloud 1080p (Direct HLS)',
+                url: makeProxyUrl(directHlsUrl, 'https://vixsrc.to/'),
+                isEmbed: false // 🎯 OUR NATIVE PLAYER!
+              });
+              return;
             }
 
-            sources.push({ provider: 'VixSrc', quality: 'VixCloud Player', url: embedPage, isEmbed: true });
+            sources.push({ provider: 'VixSrc', quality: 'VixCloud Player', url: `https://vixsrc.to${data.src}`, isEmbed: true });
           }
         }
       } catch (e) {}
     };
 
-    // 3. VidLink Direct MP4
+    // ─── 3. VidLink Direct MP4 + Subtitles ───
     const getVidLink = async () => {
       if (!tmdbId) return;
       try {
@@ -253,7 +248,7 @@ export default {
                 provider: 'VidLink Direct MP4',
                 quality: '1080p HD (Direct MP4)',
                 url: makeProxyUrl(directUrl, 'https://vidlink.pro/'),
-                isEmbed: false,
+                isEmbed: false, // 🎯 OUR NATIVE PLAYER!
                 subtitles: (data.stream.captions || []).map(c => ({ language: c.language, url: c.url }))
               });
               return;
@@ -270,7 +265,7 @@ export default {
       });
     };
 
-    // 4. Embed.su
+    // ─── 4. Embed.su Direct HLS ───
     const getEmbedSu = async () => {
       if (!tmdbId) return;
       try {
@@ -285,14 +280,14 @@ export default {
               provider: 'Embed.su Direct HLS',
               quality: 'Direct HLS (1080p)',
               url: makeProxyUrl(data.source, 'https://embed.su/'),
-              isEmbed: false
+              isEmbed: false // 🎯 OUR NATIVE PLAYER!
             });
           }
         }
       } catch (e) {}
     };
 
-    // 5. Torrentio
+    // ─── 5. Torrentio (Stremio Cached Torrents) ───
     const getTorrentio = async () => {
       if (!imdbId) return;
       try {
@@ -307,7 +302,7 @@ export default {
                   provider: 'Torrentio',
                   quality: s.title ? s.title.split('\n')[0] : `Torrent Stream ${idx + 1}`,
                   url: s.url,
-                  isEmbed: false
+                  isEmbed: false // 🎯 OUR NATIVE PLAYER!
                 });
               }
             });
@@ -316,7 +311,7 @@ export default {
       } catch (e) {}
     };
 
-    // 6. Stremify
+    // ─── 6. Stremify ───
     const getStremify = async () => {
       if (!imdbId) return;
       try {
@@ -340,31 +335,7 @@ export default {
       } catch (e) {}
     };
 
-    // 7. Nuvio
-    const getNuvio = async () => {
-      if (!imdbId) return;
-      try {
-        const path = type === 'movie' ? `movie/${imdbId}.json` : `tv/${imdbId}:${season}:${episode}.json`;
-        const res = await fetchWithTimeout(`https://nuviostreams.hayd.uk/stream/${path}`);
-        if (res && res.ok) {
-          const data = await res.json();
-          if (data && data.streams) {
-            data.streams.slice(0, 2).forEach((s, idx) => {
-              if (s.url) {
-                sources.push({
-                  provider: 'Nuvio Streams',
-                  quality: s.title || `Nuvio Stream ${idx + 1}`,
-                  url: s.url,
-                  isEmbed: false
-                });
-              }
-            });
-          }
-        }
-      } catch (e) {}
-    };
-
-    // 8-16. Fallback Scrapers
+    // ─── Fallback Embed Scrapers ───
     const getVidSrcCc = async () => {
       const id = tmdbId || imdbId;
       if (!id) return;
@@ -396,22 +367,7 @@ export default {
       sources.push({ provider: 'MultiEmbed', quality: 'MultiEmbed Auto', url: `https://multiembed.mov/directstream.php?video_id=${tmdbId}&tmdb=1`, isEmbed: true });
     };
 
-    const getRiveStream = async () => {
-      if (!tmdbId) return;
-      sources.push({ provider: 'RiveStream', quality: 'Rive HD', url: `https://rive.stream/embed?type=${type}&id=${tmdbId}`, isEmbed: true });
-    };
-
-    const getAutoEmbed = async () => {
-      if (!tmdbId) return;
-      sources.push({ provider: 'AutoEmbed', quality: 'AutoEmbed Mirror', url: `https://autoembed.co/${type}/tmdb/${tmdbId}`, isEmbed: true });
-    };
-
-    const getNontonGo = async () => {
-      if (!tmdbId) return;
-      sources.push({ provider: 'NontonGo', quality: 'NontonGo Mirror', url: `https://www.nontongo.win/embed/${type}/${tmdbId}`, isEmbed: true });
-    };
-
-    // 🎯 EXECUTE ALL 16 SCRAPERS IN PARALLEL!
+    // Execute all scrapers in parallel
     await Promise.allSettled([
       getXPass(),
       getVixSrc(),
@@ -419,19 +375,15 @@ export default {
       getEmbedSu(),
       getTorrentio(),
       getStremify(),
-      getNuvio(),
       getVidSrcCc(),
       getVidSrcMe(),
       getVidSrcTo(),
       getSmashyStream(),
       get2Embed(),
-      getMultiEmbed(),
-      getRiveStream(),
-      getAutoEmbed(),
-      getNontonGo()
+      getMultiEmbed()
     ]);
 
-    // 🏆 SORTING ALGORITHM
+    // 🏆 HIGHEST QUALITY SORTING
     function getQualityScore(qualityStr, isEmbed) {
       let score = 0;
       const q = (qualityStr || '').toLowerCase();
@@ -441,7 +393,7 @@ export default {
       else if (q.includes('720') || q.includes('hd')) score += 100;
       else score += 50;
 
-      if (!isEmbed) score += 500; // Direct streams beat embeds!
+      if (!isEmbed) score += 500; // 🎯 DIRECT STREAMS GET +500 PTS TO ALWAYS WIN!
       return score;
     }
 
