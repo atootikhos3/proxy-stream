@@ -48,7 +48,7 @@ export default {
 
     const sources = [];
 
-    // ─── 1. XPass / 1x2 Space (Direct master.m3u8 Extractor) ───
+// ─── 1. XPass / 1x2 Space ───
     const getXPass = async () => {
       const searchId = imdbId || tmdbId;
       if (!searchId) return;
@@ -82,11 +82,13 @@ export default {
               if (data && data.playlist && data.playlist[0] && data.playlist[0].sources) {
                 const hlsSource = data.playlist[0].sources.find(s => s.file && s.file.includes('.m3u8'));
                 if (hlsSource) {
+                  // Route through StreamVault's CORS proxy to bypass 404/CORS restrictions
+                  const proxiedUrl = `/proxy-stream?url=${encodeURIComponent(hlsSource.file)}`;
                   sources.push({
                     provider: 'XPass Direct HLS',
                     quality: '1080p HD (Direct HLS)',
-                    url: hlsSource.file,
-                    isEmbed: false // 🎯 PLAYS DIRECTLY IN OUR CUSTOM PLAYER!
+                    url: proxiedUrl,
+                    isEmbed: false // 🎯 PLAYS IN OUR CUSTOM PLAYER VIA PROXY!
                   });
                   return;
                 }
@@ -96,7 +98,7 @@ export default {
         }
       } catch (e) {}
 
-      // Fallback
+      // Fallback to embed
       sources.push({
         provider: 'XPass Embed',
         quality: 'XPass Player',
