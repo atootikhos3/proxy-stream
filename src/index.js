@@ -1,6 +1,6 @@
 /**
  * StreamVault Multi-Provider Resolver & Edge Stream Proxy Engine
- * Authored & Engineered for StreamVault — 100% Direct Native Stream Player
+ * Cloudflare Worker Service — Featuring TMDB->IMDb Auto-Lookup & 16-Scraper Suite
  */
 
 const CORS_HEADERS = {
@@ -67,7 +67,6 @@ export default {
           let body = await originResponse.text();
           const baseUrl = targetUrl.origin + targetUrl.pathname.substring(0, targetUrl.pathname.lastIndexOf('/') + 1);
 
-          // Rewrite m3u8 playlist lines so all chunks pass through worker proxy
           const rewritten = body.split('\n').map(line => {
             const trimmed = line.trim();
             if (!trimmed || trimmed.startsWith('#')) return line;
@@ -94,7 +93,6 @@ export default {
           });
         }
 
-        // Pipe binary video chunks (.ts / .mp4 / .m4s) with CORS headers
         const responseHeaders = new Headers(originResponse.headers);
         responseHeaders.set('Access-Control-Allow-Origin', '*');
         responseHeaders.set('Access-Control-Allow-Headers', '*');
@@ -109,9 +107,9 @@ export default {
       }
     }
 
-    // ─── 🚀 MULTI-PROVIDER RESOLVER ENDPOINT (/?id=...&imdbId=...) ───
+    // ─── 🚀 MULTI-PROVIDER RESOLVER ENDPOINT ───
     const tmdbId = url.searchParams.get('id');
-    const imdbId = url.searchParams.get('imdbId') || '';
+    let imdbId = url.searchParams.get('imdbId') || '';
     const type = url.searchParams.get('type') || 'movie';
     const season = url.searchParams.get('season') || '1';
     const episode = url.searchParams.get('episode') || '1';
@@ -123,14 +121,26 @@ export default {
       );
     }
 
+    // 🔍 AUTO-RESOLVE IMDb ID FROM TMDB ID IF MISSING
+    if (!imdbId && tmdbId) {
+      try {
+        const extRes = await fetchWithTimeout(`https://db.speedracelight.com/3/${type}/${tmdbId}/external_ids?language=en-US`, {}, 2000);
+        if (extRes && extRes.ok) {
+          const extData = await extRes.json();
+          if (extData && extData.imdb_id) {
+            imdbId = extData.imdb_id;
+          }
+        }
+      } catch (e) {}
+    }
+
     const sources = [];
 
-    // Helper: Format URL through Cloudflare Worker's Edge Proxy
     const makeProxyUrl = (targetUrl, referer) => {
       return `${url.origin}/hls-proxy?url=${encodeURIComponent(targetUrl)}&referer=${encodeURIComponent(referer)}`;
     };
 
-    // ─── 1. XPass / 1x2 Space (Direct m3u8 Extractor) ───
+    // 1. XPass
     const getXPass = async () => {
       const searchId = imdbId || tmdbId;
       if (!searchId) return;
@@ -140,10 +150,7 @@ export default {
           : `https://play.xpass.top/e/tv/${searchId}/${season}/${episode}`;
 
         const pageRes = await fetchWithTimeout(embedUrl, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-            'Referer': 'https://watch-v2.autoembed.app/'
-          }
+          headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://watch-v2.autoembed.app/' }
         });
 
         if (pageRes && pageRes.ok) {
@@ -153,10 +160,7 @@ export default {
           if (mdataMatch) {
             const mdataId = mdataMatch[1];
             const playlistRes = await fetchWithTimeout(`https://play.xpass.top/mdata/${mdataId}/1/playlist.json`, {
-              headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-                'Referer': embedUrl
-              }
+              headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': embedUrl }
             });
 
             if (playlistRes && playlistRes.ok) {
@@ -168,7 +172,7 @@ export default {
                     provider: 'XPass Direct HLS',
                     quality: '1080p HD (Direct HLS)',
                     url: makeProxyUrl(hlsSource.file, 'https://play.xpass.top/'),
-                    isEmbed: false // 🎯 100% NATIVE PLAYER!
+                    isEmbed: false
                   });
                   return;
                 }
@@ -177,9 +181,16 @@ export default {
           }
         }
       } catch (e) {}
+
+      sources.push({
+        provider: 'XPass',
+        quality: 'XPass Player',
+        url: type === 'movie' ? `https://play.xpass.top/e/movie/${searchId}` : `https://play.xpass.top/e/tv/${searchId}/${season}/${episode}`,
+        isEmbed: true
+      });
     };
 
-    // ─── 2. VixSrc Direct HLS Extractor ───
+    // 2. VixSrc
     const getVixSrc = async () => {
       if (!tmdbId) return;
       try {
@@ -188,10 +199,7 @@ export default {
           : `https://vixsrc.to/api/tv/${tmdbId}/${season}/${episode}`;
 
         const res = await fetchWithTimeout(apiEndpoint, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-            'Referer': `https://vixsrc.to/${type}/${tmdbId}`
-          }
+          headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': `https://vixsrc.to/${type}/${tmdbId}` }
         });
 
         if (res && res.ok) {
@@ -211,26 +219,25 @@ export default {
                   provider: 'VixSrc Direct HLS',
                   quality: 'VixCloud 1080p (Direct HLS)',
                   url: makeProxyUrl(playlistUrl, 'https://vixsrc.to/'),
-                  isEmbed: false // 🎯 100% NATIVE PLAYER!
+                  isEmbed: false
                 });
                 return;
               }
             }
+
+            sources.push({ provider: 'VixSrc', quality: 'VixCloud Player', url: embedPage, isEmbed: true });
           }
         }
       } catch (e) {}
     };
 
-    // ─── 3. VidLink Direct MP4 + Subtitles ───
+    // 3. VidLink Direct MP4
     const getVidLink = async () => {
       if (!tmdbId) return;
       try {
         const encPath = type === 'movie' ? `movie/${tmdbId}` : `tv/${tmdbId}/${season}/${episode}`;
         const res = await fetchWithTimeout(`https://vidlink.pro/api/b/${encPath}?multiLang=0`, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-            'Referer': `https://vidlink.pro/${encPath}`
-          }
+          headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': `https://vidlink.pro/${encPath}` }
         });
 
         if (res && res.ok) {
@@ -246,20 +253,24 @@ export default {
                 provider: 'VidLink Direct MP4',
                 quality: '1080p HD (Direct MP4)',
                 url: makeProxyUrl(directUrl, 'https://vidlink.pro/'),
-                isEmbed: false, // 🎯 100% NATIVE PLAYER!
-                subtitles: (data.stream.captions || []).map(c => ({
-                  language: c.language,
-                  url: c.url
-                }))
+                isEmbed: false,
+                subtitles: (data.stream.captions || []).map(c => ({ language: c.language, url: c.url }))
               });
               return;
             }
           }
         }
       } catch (e) {}
+
+      sources.push({
+        provider: 'VidLink',
+        quality: 'VidLink Player HD',
+        url: type === 'movie' ? `https://vidlink.pro/movie/${tmdbId}` : `https://vidlink.pro/tv/${tmdbId}/${season}/${episode}`,
+        isEmbed: true
+      });
     };
 
-    // ─── 4. Embed.su Direct HLS Extractor ───
+    // 4. Embed.su
     const getEmbedSu = async () => {
       if (!tmdbId) return;
       try {
@@ -274,14 +285,14 @@ export default {
               provider: 'Embed.su Direct HLS',
               quality: 'Direct HLS (1080p)',
               url: makeProxyUrl(data.source, 'https://embed.su/'),
-              isEmbed: false // 🎯 100% NATIVE PLAYER!
+              isEmbed: false
             });
           }
         }
       } catch (e) {}
     };
 
-    // ─── 5. Torrentio Cached Stream ───
+    // 5. Torrentio
     const getTorrentio = async () => {
       if (!imdbId) return;
       try {
@@ -296,7 +307,7 @@ export default {
                   provider: 'Torrentio',
                   quality: s.title ? s.title.split('\n')[0] : `Torrent Stream ${idx + 1}`,
                   url: s.url,
-                  isEmbed: false // 🎯 100% NATIVE PLAYER!
+                  isEmbed: false
                 });
               }
             });
@@ -305,19 +316,136 @@ export default {
       } catch (e) {}
     };
 
-    // Execute direct stream scrapers in parallel
+    // 6. Stremify
+    const getStremify = async () => {
+      if (!imdbId) return;
+      try {
+        const path = type === 'movie' ? `movie/${imdbId}.json` : `tv/${imdbId}:${season}:${episode}.json`;
+        const res = await fetchWithTimeout(`https://stremify.hayd.uk/stream/${path}`);
+        if (res && res.ok) {
+          const data = await res.json();
+          if (data && data.streams) {
+            data.streams.slice(0, 2).forEach((s, idx) => {
+              if (s.url) {
+                sources.push({
+                  provider: 'Stremify Direct',
+                  quality: s.title || `Stremify Stream ${idx + 1}`,
+                  url: s.url,
+                  isEmbed: false
+                });
+              }
+            });
+          }
+        }
+      } catch (e) {}
+    };
+
+    // 7. Nuvio
+    const getNuvio = async () => {
+      if (!imdbId) return;
+      try {
+        const path = type === 'movie' ? `movie/${imdbId}.json` : `tv/${imdbId}:${season}:${episode}.json`;
+        const res = await fetchWithTimeout(`https://nuviostreams.hayd.uk/stream/${path}`);
+        if (res && res.ok) {
+          const data = await res.json();
+          if (data && data.streams) {
+            data.streams.slice(0, 2).forEach((s, idx) => {
+              if (s.url) {
+                sources.push({
+                  provider: 'Nuvio Streams',
+                  quality: s.title || `Nuvio Stream ${idx + 1}`,
+                  url: s.url,
+                  isEmbed: false
+                });
+              }
+            });
+          }
+        }
+      } catch (e) {}
+    };
+
+    // 8-16. Fallback Scrapers
+    const getVidSrcCc = async () => {
+      const id = tmdbId || imdbId;
+      if (!id) return;
+      sources.push({ provider: 'VidSrc.cc', quality: 'VidSrc v2 Pro HD', url: `https://vidsrc.cc/v2/embed/${type}/${id}`, isEmbed: true });
+    };
+
+    const getVidSrcMe = async () => {
+      if (!tmdbId) return;
+      sources.push({ provider: 'VidSrc.me', quality: 'VidSrc Multi-Host', url: `https://vidsrc.me/embed/${type}?tmdb=${tmdbId}`, isEmbed: true });
+    };
+
+    const getVidSrcTo = async () => {
+      if (!tmdbId) return;
+      sources.push({ provider: 'VidSrc.to', quality: 'VidSrc Fast HD', url: `https://vidsrc.to/embed/${type}/${tmdbId}`, isEmbed: true });
+    };
+
+    const getSmashyStream = async () => {
+      if (!tmdbId) return;
+      sources.push({ provider: 'SmashyStream', quality: 'Smashy Multi-Server', url: `https://embed.smashystream.com/playere.php?tmdb=${tmdbId}`, isEmbed: true });
+    };
+
+    const get2Embed = async () => {
+      if (!tmdbId) return;
+      sources.push({ provider: '2Embed', quality: '2Embed Server', url: `https://www.2embed.cc/embed/${tmdbId}`, isEmbed: true });
+    };
+
+    const getMultiEmbed = async () => {
+      if (!tmdbId) return;
+      sources.push({ provider: 'MultiEmbed', quality: 'MultiEmbed Auto', url: `https://multiembed.mov/directstream.php?video_id=${tmdbId}&tmdb=1`, isEmbed: true });
+    };
+
+    const getRiveStream = async () => {
+      if (!tmdbId) return;
+      sources.push({ provider: 'RiveStream', quality: 'Rive HD', url: `https://rive.stream/embed?type=${type}&id=${tmdbId}`, isEmbed: true });
+    };
+
+    const getAutoEmbed = async () => {
+      if (!tmdbId) return;
+      sources.push({ provider: 'AutoEmbed', quality: 'AutoEmbed Mirror', url: `https://autoembed.co/${type}/tmdb/${tmdbId}`, isEmbed: true });
+    };
+
+    const getNontonGo = async () => {
+      if (!tmdbId) return;
+      sources.push({ provider: 'NontonGo', quality: 'NontonGo Mirror', url: `https://www.nontongo.win/embed/${type}/${tmdbId}`, isEmbed: true });
+    };
+
+    // 🎯 EXECUTE ALL 16 SCRAPERS IN PARALLEL!
     await Promise.allSettled([
       getXPass(),
       getVixSrc(),
       getVidLink(),
       getEmbedSu(),
-      getTorrentio()
+      getTorrentio(),
+      getStremify(),
+      getNuvio(),
+      getVidSrcCc(),
+      getVidSrcMe(),
+      getVidSrcTo(),
+      getSmashyStream(),
+      get2Embed(),
+      getMultiEmbed(),
+      getRiveStream(),
+      getAutoEmbed(),
+      getNontonGo()
     ]);
 
-    // Ensure all direct stream sources have isEmbed: false
-    sources.forEach(src => {
-      src.isEmbed = false;
-    });
+    // 🏆 SORTING ALGORITHM
+    function getQualityScore(qualityStr, isEmbed) {
+      let score = 0;
+      const q = (qualityStr || '').toLowerCase();
+      if (q.includes('4k') || q.includes('2160') || q.includes('uhd')) score += 400;
+      else if (q.includes('2k') || q.includes('1440')) score += 300;
+      else if (q.includes('1080') || q.includes('fhd')) score += 200;
+      else if (q.includes('720') || q.includes('hd')) score += 100;
+      else score += 50;
+
+      if (!isEmbed) score += 500; // Direct streams beat embeds!
+      return score;
+    }
+
+    sources.sort((a, b) => getQualityScore(b.quality, b.isEmbed) - getQualityScore(a.quality, a.isEmbed));
 
     return new Response(
       JSON.stringify({
