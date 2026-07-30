@@ -1,6 +1,6 @@
 /**
  * StreamVault Multi-Provider Resolver Engine
- * Universal CORS Proxy-Wrapped Stream Aggregator
+ * Cloudflare Worker Service — Direct Stream & Embed Aggregator
  */
 
 const CORS_HEADERS = {
@@ -46,107 +46,7 @@ export default {
 
     const sources = [];
 
-    // ─── 1. XPass / 1x2 Space ───
-    const getXPass = async () => {
-      const searchId = imdbId || tmdbId;
-      if (!searchId) return;
-      try {
-        const embedUrl = type === 'movie'
-          ? `https://play.xpass.top/e/movie/${searchId}`
-          : `https://play.xpass.top/e/tv/${searchId}/${season}/${episode}`;
-
-        const pageRes = await fetchWithTimeout(embedUrl, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-            'Referer': 'https://watch-v2.autoembed.app/'
-          }
-        });
-
-        if (pageRes && pageRes.ok) {
-          const html = await pageRes.text();
-          const mdataMatch = html.match(/\/mdata\/([a-zA-Z0-9_-]+)\/1\/playlist\.json/);
-          
-          if (mdataMatch) {
-            const mdataId = mdataMatch[1];
-            const playlistRes = await fetchWithTimeout(`https://play.xpass.top/mdata/${mdataId}/1/playlist.json`, {
-              headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-                'Referer': embedUrl
-              }
-            });
-
-            if (playlistRes && playlistRes.ok) {
-              const data = await playlistRes.json();
-              if (data && data.playlist && data.playlist[0] && data.playlist[0].sources) {
-                const hlsSource = data.playlist[0].sources.find(s => s.file && s.file.includes('.m3u8'));
-                if (hlsSource) {
-                  sources.push({
-                    provider: 'XPass Direct HLS',
-                    quality: '1080p HD (Direct HLS)',
-                    url: hlsSource.file,
-                    isEmbed: false
-                  });
-                  return;
-                }
-              }
-            }
-          }
-        }
-      } catch (e) {}
-
-      sources.push({
-        provider: 'XPass Embed',
-        quality: 'XPass Player',
-        url: type === 'movie' ? `https://play.xpass.top/e/movie/${searchId}` : `https://play.xpass.top/e/tv/${searchId}/${season}/${episode}`,
-        isEmbed: true
-      });
-    };
-
-    // ─── 2. VixSrc Direct HLS ───
-    const getVixSrc = async () => {
-      if (!tmdbId) return;
-      try {
-        const apiEndpoint = type === 'movie' 
-          ? `https://vixsrc.to/api/movie/${tmdbId}`
-          : `https://vixsrc.to/api/tv/${tmdbId}/${season}/${episode}`;
-
-        const res = await fetchWithTimeout(apiEndpoint, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-            'Referer': `https://vixsrc.to/${type}/${tmdbId}`
-          }
-        });
-
-        if (res && res.ok) {
-          const data = await res.json();
-          if (data && data.src) {
-            const embedPage = `https://vixsrc.to${data.src}`;
-            const embedRes = await fetchWithTimeout(embedPage, {
-              headers: { 'Referer': `https://vixsrc.to/${type}/${tmdbId}` }
-            });
-
-            if (embedRes && embedRes.ok) {
-              const embedHtml = await embedRes.text();
-              const playlistMatch = embedHtml.match(/playlist\/(\d+)\?type=video[^"']*/);
-              if (playlistMatch) {
-                const playlistUrl = `https://vixsrc.to/${playlistMatch[0]}`;
-                sources.push({
-                  provider: 'VixSrc Direct HLS',
-                  quality: 'VixCloud 1080p (Direct HLS)',
-                  url: playlistUrl,
-                  isEmbed: false
-                });
-                return;
-              }
-            }
-
-            sources.push({ provider: 'VixSrc', quality: 'VixCloud Player', url: embedPage, isEmbed: true });
-          }
-        }
-      } catch (e) {}
-    };
-
-    // ─── 3. VidLink Direct MP4 + Subtitles ───
+    // ─── 1. VidLink Direct MP4 + Subtitles (Native Player - 0 Ads) ───
     const getVidLink = async () => {
       if (!tmdbId) return;
       try {
@@ -191,7 +91,7 @@ export default {
       });
     };
 
-    // ─── 4. Embed.su Direct HLS ───
+    // ─── 2. Embed.su Direct HLS (Native Player - 0 Ads) ───
     const getEmbedSu = async () => {
       if (!tmdbId) return;
       try {
@@ -213,7 +113,7 @@ export default {
       } catch (e) {}
     };
 
-    // ─── 5. Torrentio (Stremio) ───
+    // ─── 3. Torrentio Cached Stream (Native Player) ───
     const getTorrentio = async () => {
       if (!imdbId) return;
       try {
@@ -237,54 +137,98 @@ export default {
       } catch (e) {}
     };
 
-    // ─── Fallback Embed Scrapers ───
+    // ─── 4. XPass Embed ───
+    const getXPass = async () => {
+      const searchId = imdbId || tmdbId;
+      if (!searchId) return;
+      const embedUrl = type === 'movie'
+        ? `https://play.xpass.top/e/movie/${searchId}`
+        : `https://play.xpass.top/e/tv/${searchId}/${season}/${episode}`;
+      sources.push({ provider: 'XPass', quality: 'TIK Player HD', url: embedUrl, isEmbed: true });
+    };
+
+    // ─── 5. VixSrc Embed ───
+    const getVixSrc = async () => {
+      if (!tmdbId) return;
+      try {
+        const apiEndpoint = type === 'movie' 
+          ? `https://vixsrc.to/api/movie/${tmdbId}`
+          : `https://vixsrc.to/api/tv/${tmdbId}/${season}/${episode}`;
+
+        const res = await fetchWithTimeout(apiEndpoint, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+            'Referer': `https://vixsrc.to/${type}/${tmdbId}`
+          }
+        });
+
+        if (res && res.ok) {
+          const data = await res.json();
+          if (data && data.src) {
+            sources.push({
+              provider: 'VixSrc',
+              quality: 'VixCloud Player',
+              url: `https://vixsrc.to${data.src}`,
+              isEmbed: true
+            });
+          }
+        }
+      } catch (e) {}
+    };
+
+    // ─── 6. VidSrc.cc (v2) ───
     const getVidSrcCc = async () => {
       const id = tmdbId || imdbId;
       if (!id) return;
       sources.push({ provider: 'VidSrc.cc', quality: 'VidSrc v2 Pro HD', url: `https://vidsrc.cc/v2/embed/${type}/${id}`, isEmbed: true });
     };
 
-    const getVidSrcMe = async () => {
-      if (!tmdbId) return;
-      sources.push({ provider: 'VidSrc.me', quality: 'VidSrc Multi-Host', url: `https://vidsrc.me/embed/${type}?tmdb=${tmdbId}`, isEmbed: true });
-    };
-
+    // ─── 7. VidSrc.to ───
     const getVidSrcTo = async () => {
       if (!tmdbId) return;
       sources.push({ provider: 'VidSrc.to', quality: 'VidSrc Fast HD', url: `https://vidsrc.to/embed/${type}/${tmdbId}`, isEmbed: true });
     };
 
+    // ─── 8. VidSrc.me ───
+    const getVidSrcMe = async () => {
+      if (!tmdbId) return;
+      sources.push({ provider: 'VidSrc.me', quality: 'VidSrc Multi-Host', url: `https://vidsrc.me/embed/${type}?tmdb=${tmdbId}`, isEmbed: true });
+    };
+
+    // ─── 9. SmashyStream ───
     const getSmashyStream = async () => {
       if (!tmdbId) return;
       sources.push({ provider: 'SmashyStream', quality: 'Smashy Multi-Server', url: `https://embed.smashystream.com/playere.php?tmdb=${tmdbId}`, isEmbed: true });
     };
 
+    // ─── 10. 2Embed ───
     const get2Embed = async () => {
       if (!tmdbId) return;
       sources.push({ provider: '2Embed', quality: '2Embed Server', url: `https://www.2embed.cc/embed/${tmdbId}`, isEmbed: true });
     };
 
+    // ─── 11. MultiEmbed ───
     const getMultiEmbed = async () => {
       if (!tmdbId) return;
       sources.push({ provider: 'MultiEmbed', quality: 'MultiEmbed Auto', url: `https://multiembed.mov/directstream.php?video_id=${tmdbId}&tmdb=1`, isEmbed: true });
     };
 
-    // Execute all scrapers concurrently
+    // Execute all scrapers in parallel
     await Promise.allSettled([
-      getXPass(),
-      getVixSrc(),
       getVidLink(),
       getEmbedSu(),
       getTorrentio(),
+      getXPass(),
+      getVixSrc(),
       getVidSrcCc(),
-      getVidSrcMe(),
       getVidSrcTo(),
+      getVidSrcMe(),
       getSmashyStream(),
       get2Embed(),
       getMultiEmbed()
     ]);
 
-    // 🏆 HIGHEST QUALITY SORTING
+    // 🏆 SORTING: Direct Streams First, then High Quality
     function getQualityScore(qualityStr, isEmbed) {
       let score = 0;
       const q = (qualityStr || '').toLowerCase();
@@ -294,18 +238,11 @@ export default {
       else if (q.includes('720') || q.includes('hd')) score += 100;
       else score += 50;
 
-      if (!isEmbed) score += 100; // Direct streams beat embeds!
+      if (!isEmbed) score += 500; // Direct streams beat embeds every time!
       return score;
     }
 
     sources.sort((a, b) => getQualityScore(b.quality, b.isEmbed) - getQualityScore(a.quality, a.isEmbed));
-
-    // 🛡️ UNIVERSAL CORS PROXY WRAPPER: Wrap ALL direct stream URLs in /proxy-stream?url=
-    sources.forEach(src => {
-      if (!src.isEmbed && src.url && src.url.startsWith('http') && !src.url.startsWith('/proxy-stream')) {
-        src.url = `/proxy-stream?url=${encodeURIComponent(src.url)}`;
-      }
-    });
 
     return new Response(
       JSON.stringify({
