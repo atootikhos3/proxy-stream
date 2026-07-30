@@ -1,11 +1,11 @@
 /**
- * StreamVault Multi-Provider Resolver Engine
- * Cloudflare Worker Service — Direct Stream & Embed Aggregator
+ * StreamVault Multi-Provider Resolver & Edge Stream Proxy Engine
+ * Authored & Engineered for StreamVault — 100% Direct Native Stream Player
  */
 
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, OPTIONS',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
   'Access-Control-Allow-Headers': '*',
   'Content-Type': 'application/json'
 };
@@ -31,6 +31,85 @@ export default {
       return new Response(null, { headers: CORS_HEADERS });
     }
 
+    // ─── 🛡️ EDGE HLS PROXY ENDPOINT (/hls-proxy?url=...&referer=...) ───
+    if (url.pathname === '/hls-proxy') {
+      const targetUrlStr = url.searchParams.get('url');
+      const refererHeader = url.searchParams.get('referer') || 'https://player.videasy.to';
+
+      if (!targetUrlStr) {
+        return new Response('Missing target URL parameter', { status: 400 });
+      }
+
+      try {
+        const targetUrl = new URL(targetUrlStr);
+        const reqHeaders = {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36',
+          'Referer': refererHeader,
+          'Origin': new URL(refererHeader).origin,
+          'Accept': '*/*',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Cache-Control': 'no-cache'
+        };
+
+        if (request.headers.get('range')) {
+          reqHeaders['Range'] = request.headers.get('range');
+        }
+
+        const originResponse = await fetch(targetUrlStr, {
+          method: request.method,
+          headers: reqHeaders
+        });
+
+        const contentType = originResponse.headers.get('content-type') || '';
+        const isM3u8 = targetUrl.pathname.endsWith('.m3u8') || contentType.includes('mpegurl') || contentType.includes('m3u8');
+
+        if (isM3u8 && originResponse.ok) {
+          let body = await originResponse.text();
+          const baseUrl = targetUrl.origin + targetUrl.pathname.substring(0, targetUrl.pathname.lastIndexOf('/') + 1);
+
+          // Rewrite m3u8 playlist lines so all chunks pass through worker proxy
+          const rewritten = body.split('\n').map(line => {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith('#')) return line;
+
+            let resolvedUrl;
+            if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+              resolvedUrl = trimmed;
+            } else if (trimmed.startsWith('/')) {
+              resolvedUrl = targetUrl.origin + trimmed;
+            } else {
+              resolvedUrl = baseUrl + trimmed;
+            }
+
+            return `${url.origin}/hls-proxy?url=${encodeURIComponent(resolvedUrl)}&referer=${encodeURIComponent(refererHeader)}`;
+          }).join('\n');
+
+          return new Response(rewritten, {
+            status: 200,
+            headers: {
+              'Content-Type': 'application/vnd.apple.mpegurl',
+              'Access-Control-Allow-Origin': '*',
+              'Cache-Control': 'no-cache'
+            }
+          });
+        }
+
+        // Pipe binary video chunks (.ts / .mp4 / .m4s) with CORS headers
+        const responseHeaders = new Headers(originResponse.headers);
+        responseHeaders.set('Access-Control-Allow-Origin', '*');
+        responseHeaders.set('Access-Control-Allow-Headers', '*');
+
+        return new Response(originResponse.body, {
+          status: originResponse.status,
+          headers: responseHeaders
+        });
+
+      } catch (err) {
+        return new Response(`Worker Stream Proxy Error: ${err.message}`, { status: 502 });
+      }
+    }
+
+    // ─── 🚀 MULTI-PROVIDER RESOLVER ENDPOINT (/?id=...&imdbId=...) ───
     const tmdbId = url.searchParams.get('id');
     const imdbId = url.searchParams.get('imdbId') || '';
     const type = url.searchParams.get('type') || 'movie';
@@ -46,7 +125,103 @@ export default {
 
     const sources = [];
 
-    // ─── 1. VidLink Direct MP4 + Subtitles (Native Player - 0 Ads) ───
+    // Helper: Format URL through Cloudflare Worker's Edge Proxy
+    const makeProxyUrl = (targetUrl, referer) => {
+      return `${url.origin}/hls-proxy?url=${encodeURIComponent(targetUrl)}&referer=${encodeURIComponent(referer)}`;
+    };
+
+    // ─── 1. XPass / 1x2 Space (Direct m3u8 Extractor) ───
+    const getXPass = async () => {
+      const searchId = imdbId || tmdbId;
+      if (!searchId) return;
+      try {
+        const embedUrl = type === 'movie'
+          ? `https://play.xpass.top/e/movie/${searchId}`
+          : `https://play.xpass.top/e/tv/${searchId}/${season}/${episode}`;
+
+        const pageRes = await fetchWithTimeout(embedUrl, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+            'Referer': 'https://watch-v2.autoembed.app/'
+          }
+        });
+
+        if (pageRes && pageRes.ok) {
+          const html = await pageRes.text();
+          const mdataMatch = html.match(/\/mdata\/([a-zA-Z0-9_-]+)\/1\/playlist\.json/);
+          
+          if (mdataMatch) {
+            const mdataId = mdataMatch[1];
+            const playlistRes = await fetchWithTimeout(`https://play.xpass.top/mdata/${mdataId}/1/playlist.json`, {
+              headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                'Referer': embedUrl
+              }
+            });
+
+            if (playlistRes && playlistRes.ok) {
+              const data = await playlistRes.json();
+              if (data && data.playlist && data.playlist[0] && data.playlist[0].sources) {
+                const hlsSource = data.playlist[0].sources.find(s => s.file && s.file.includes('.m3u8'));
+                if (hlsSource) {
+                  sources.push({
+                    provider: 'XPass Direct HLS',
+                    quality: '1080p HD (Direct HLS)',
+                    url: makeProxyUrl(hlsSource.file, 'https://play.xpass.top/'),
+                    isEmbed: false // 🎯 100% NATIVE PLAYER!
+                  });
+                  return;
+                }
+              }
+            }
+          }
+        }
+      } catch (e) {}
+    };
+
+    // ─── 2. VixSrc Direct HLS Extractor ───
+    const getVixSrc = async () => {
+      if (!tmdbId) return;
+      try {
+        const apiEndpoint = type === 'movie' 
+          ? `https://vixsrc.to/api/movie/${tmdbId}`
+          : `https://vixsrc.to/api/tv/${tmdbId}/${season}/${episode}`;
+
+        const res = await fetchWithTimeout(apiEndpoint, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+            'Referer': `https://vixsrc.to/${type}/${tmdbId}`
+          }
+        });
+
+        if (res && res.ok) {
+          const data = await res.json();
+          if (data && data.src) {
+            const embedPage = `https://vixsrc.to${data.src}`;
+            const embedRes = await fetchWithTimeout(embedPage, {
+              headers: { 'Referer': `https://vixsrc.to/${type}/${tmdbId}` }
+            });
+
+            if (embedRes && embedRes.ok) {
+              const embedHtml = await embedRes.text();
+              const playlistMatch = embedHtml.match(/playlist\/(\d+)\?type=video[^"']*/);
+              if (playlistMatch) {
+                const playlistUrl = `https://vixsrc.to/${playlistMatch[0]}`;
+                sources.push({
+                  provider: 'VixSrc Direct HLS',
+                  quality: 'VixCloud 1080p (Direct HLS)',
+                  url: makeProxyUrl(playlistUrl, 'https://vixsrc.to/'),
+                  isEmbed: false // 🎯 100% NATIVE PLAYER!
+                });
+                return;
+              }
+            }
+          }
+        }
+      } catch (e) {}
+    };
+
+    // ─── 3. VidLink Direct MP4 + Subtitles ───
     const getVidLink = async () => {
       if (!tmdbId) return;
       try {
@@ -70,8 +245,8 @@ export default {
               sources.push({
                 provider: 'VidLink Direct MP4',
                 quality: '1080p HD (Direct MP4)',
-                url: directUrl,
-                isEmbed: false,
+                url: makeProxyUrl(directUrl, 'https://vidlink.pro/'),
+                isEmbed: false, // 🎯 100% NATIVE PLAYER!
                 subtitles: (data.stream.captions || []).map(c => ({
                   language: c.language,
                   url: c.url
@@ -82,16 +257,9 @@ export default {
           }
         }
       } catch (e) {}
-
-      sources.push({
-        provider: 'VidLink',
-        quality: 'VidLink Player HD',
-        url: type === 'movie' ? `https://vidlink.pro/movie/${tmdbId}` : `https://vidlink.pro/tv/${tmdbId}/${season}/${episode}`,
-        isEmbed: true
-      });
     };
 
-    // ─── 2. Embed.su Direct HLS (Native Player - 0 Ads) ───
+    // ─── 4. Embed.su Direct HLS Extractor ───
     const getEmbedSu = async () => {
       if (!tmdbId) return;
       try {
@@ -103,17 +271,17 @@ export default {
           const data = await res.json();
           if (data && data.source) {
             sources.push({
-              provider: 'Embed.su',
+              provider: 'Embed.su Direct HLS',
               quality: 'Direct HLS (1080p)',
-              url: data.source,
-              isEmbed: false
+              url: makeProxyUrl(data.source, 'https://embed.su/'),
+              isEmbed: false // 🎯 100% NATIVE PLAYER!
             });
           }
         }
       } catch (e) {}
     };
 
-    // ─── 3. Torrentio Cached Stream (Native Player) ───
+    // ─── 5. Torrentio Cached Stream ───
     const getTorrentio = async () => {
       if (!imdbId) return;
       try {
@@ -128,7 +296,7 @@ export default {
                   provider: 'Torrentio',
                   quality: s.title ? s.title.split('\n')[0] : `Torrent Stream ${idx + 1}`,
                   url: s.url,
-                  isEmbed: false
+                  isEmbed: false // 🎯 100% NATIVE PLAYER!
                 });
               }
             });
@@ -137,112 +305,19 @@ export default {
       } catch (e) {}
     };
 
-    // ─── 4. XPass Embed ───
-    const getXPass = async () => {
-      const searchId = imdbId || tmdbId;
-      if (!searchId) return;
-      const embedUrl = type === 'movie'
-        ? `https://play.xpass.top/e/movie/${searchId}`
-        : `https://play.xpass.top/e/tv/${searchId}/${season}/${episode}`;
-      sources.push({ provider: 'XPass', quality: 'TIK Player HD', url: embedUrl, isEmbed: true });
-    };
-
-    // ─── 5. VixSrc Embed ───
-    const getVixSrc = async () => {
-      if (!tmdbId) return;
-      try {
-        const apiEndpoint = type === 'movie' 
-          ? `https://vixsrc.to/api/movie/${tmdbId}`
-          : `https://vixsrc.to/api/tv/${tmdbId}/${season}/${episode}`;
-
-        const res = await fetchWithTimeout(apiEndpoint, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-            'Referer': `https://vixsrc.to/${type}/${tmdbId}`
-          }
-        });
-
-        if (res && res.ok) {
-          const data = await res.json();
-          if (data && data.src) {
-            sources.push({
-              provider: 'VixSrc',
-              quality: 'VixCloud Player',
-              url: `https://vixsrc.to${data.src}`,
-              isEmbed: true
-            });
-          }
-        }
-      } catch (e) {}
-    };
-
-    // ─── 6. VidSrc.cc (v2) ───
-    const getVidSrcCc = async () => {
-      const id = tmdbId || imdbId;
-      if (!id) return;
-      sources.push({ provider: 'VidSrc.cc', quality: 'VidSrc v2 Pro HD', url: `https://vidsrc.cc/v2/embed/${type}/${id}`, isEmbed: true });
-    };
-
-    // ─── 7. VidSrc.to ───
-    const getVidSrcTo = async () => {
-      if (!tmdbId) return;
-      sources.push({ provider: 'VidSrc.to', quality: 'VidSrc Fast HD', url: `https://vidsrc.to/embed/${type}/${tmdbId}`, isEmbed: true });
-    };
-
-    // ─── 8. VidSrc.me ───
-    const getVidSrcMe = async () => {
-      if (!tmdbId) return;
-      sources.push({ provider: 'VidSrc.me', quality: 'VidSrc Multi-Host', url: `https://vidsrc.me/embed/${type}?tmdb=${tmdbId}`, isEmbed: true });
-    };
-
-    // ─── 9. SmashyStream ───
-    const getSmashyStream = async () => {
-      if (!tmdbId) return;
-      sources.push({ provider: 'SmashyStream', quality: 'Smashy Multi-Server', url: `https://embed.smashystream.com/playere.php?tmdb=${tmdbId}`, isEmbed: true });
-    };
-
-    // ─── 10. 2Embed ───
-    const get2Embed = async () => {
-      if (!tmdbId) return;
-      sources.push({ provider: '2Embed', quality: '2Embed Server', url: `https://www.2embed.cc/embed/${tmdbId}`, isEmbed: true });
-    };
-
-    // ─── 11. MultiEmbed ───
-    const getMultiEmbed = async () => {
-      if (!tmdbId) return;
-      sources.push({ provider: 'MultiEmbed', quality: 'MultiEmbed Auto', url: `https://multiembed.mov/directstream.php?video_id=${tmdbId}&tmdb=1`, isEmbed: true });
-    };
-
-    // Execute all scrapers in parallel
+    // Execute direct stream scrapers in parallel
     await Promise.allSettled([
-      getVidLink(),
-      getEmbedSu(),
-      getTorrentio(),
       getXPass(),
       getVixSrc(),
-      getVidSrcCc(),
-      getVidSrcTo(),
-      getVidSrcMe(),
-      getSmashyStream(),
-      get2Embed(),
-      getMultiEmbed()
+      getVidLink(),
+      getEmbedSu(),
+      getTorrentio()
     ]);
 
-    // 🏆 SORTING: Direct Streams First, then High Quality
-    function getQualityScore(qualityStr, isEmbed) {
-      let score = 0;
-      const q = (qualityStr || '').toLowerCase();
-      if (q.includes('4k') || q.includes('2160') || q.includes('uhd')) score += 400;
-      else if (q.includes('2k') || q.includes('1440')) score += 300;
-      else if (q.includes('1080') || q.includes('fhd')) score += 200;
-      else if (q.includes('720') || q.includes('hd')) score += 100;
-      else score += 50;
-
-      if (!isEmbed) score += 500; // Direct streams beat embeds every time!
-      return score;
-    }
-
-    sources.sort((a, b) => getQualityScore(b.quality, b.isEmbed) - getQualityScore(a.quality, a.isEmbed));
+    // Ensure all direct stream sources have isEmbed: false
+    sources.forEach(src => {
+      src.isEmbed = false;
+    });
 
     return new Response(
       JSON.stringify({
