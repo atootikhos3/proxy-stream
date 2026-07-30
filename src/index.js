@@ -203,7 +203,7 @@ export default {
       sources.push({ provider: 'VidSrc.to', quality: 'VidSrc Pro HD', url: embedUrl, isEmbed: true });
     };
 
-    // Execute all scrapers concurrently
+// Execute all scrapers concurrently in parallel
     await Promise.allSettled([
       getVixSrc(),
       getXPass(),
@@ -214,12 +214,33 @@ export default {
       getVidSrcTo()
     ]);
 
+    // 🏆 HIGHEST QUALITY + FASTEST SPEED SORTING ALGORITHM
+    function getQualityScore(qualityStr, isEmbed) {
+      let score = 0;
+      const q = (qualityStr || '').toLowerCase();
+      
+      if (q.includes('4k') || q.includes('2160') || q.includes('uhd')) score += 400;
+      else if (q.includes('2k') || q.includes('1440')) score += 300;
+      else if (q.includes('1080') || q.includes('fhd')) score += 200;
+      else if (q.includes('720') || q.includes('hd')) score += 100;
+      else score += 50;
+
+      // Direct streams (non-embed) get bonus points for speed & native TV remote controls
+      if (!isEmbed) score += 50;
+
+      return score;
+    }
+
+    // Sort sources: Highest Quality & Direct Streams First
+    sources.sort((a, b) => getQualityScore(b.quality, b.isEmbed) - getQualityScore(a.quality, a.isEmbed));
+
     return new Response(
       JSON.stringify({
         tmdbId,
         imdbId,
         type,
         sourcesCount: sources.length,
+        primarySource: sources[0] ? sources[0].quality : 'None',
         sources
       }),
       { status: 200, headers: CORS_HEADERS }
