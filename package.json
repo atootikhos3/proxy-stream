@@ -1,0 +1,13 @@
+{
+  "name": "streamvault-api",
+  "version": "1.0.0",
+  "description": "StreamVault Multi-Provider Stream Aggregator Worker Engine",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^3.80.0"
+  }
+}
