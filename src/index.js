@@ -300,23 +300,113 @@ export default {
 
     sources.sort((a, b) => getQualityScore(b.quality, b.isEmbed) - getQualityScore(a.quality, a.isEmbed));
 
-    // 🛡️ UNIVERSAL CORS PROXY WRAPPER: Wrap ALL direct stream URLs in /proxy-stream?url=
-    sources.forEach(src => {
-      if (!src.isEmbed && src.url && src.url.startsWith('http') && !src.url.startsWith('/proxy-stream')) {
-        src.url = `/proxy-stream?url=${encodeURIComponent(src.url)}`;
-      }
-    });
+// ─── Universal Stream Proxy: /proxy-stream?url=... ───
+    if (req.url.startsWith('/proxy-stream')) {
+        const reqUrl = new URL(req.url, `http://localhost:${PORT}`);
+        const targetUrlStr = reqUrl.searchParams.get('url');
 
-    return new Response(
-      JSON.stringify({
-        tmdbId,
-        imdbId,
-        type,
-        sourcesCount: sources.length,
-        primarySource: sources[0] ? `${sources[0].provider} (${sources[0].quality})` : 'None',
-        sources
-      }),
-      { status: 200, headers: CORS_HEADERS }
-    );
-  }
-};
+        if (!targetUrlStr) {
+            res.writeHead(400, { 'Content-Type': 'text/plain' });
+            res.end('Missing url parameter');
+            return;
+        }
+
+        let targetUrl;
+        try {
+            targetUrl = new URL(targetUrlStr);
+        } catch (e) {
+            res.writeHead(400, { 'Content-Type': 'text/plain' });
+            res.end('Invalid target URL');
+            return;
+        }
+
+        // Determine spoofed referer/origin based on domain
+        let activeOrigin = 'https://player.videasy.to';
+        if (targetUrl.hostname.includes('1x2.space') || targetUrl.hostname.includes('xpass')) {
+            activeOrigin = 'https://play.xpass.top';
+        } else if (targetUrl.hostname.includes('vix') || targetUrl.hostname.includes('vixcloud')) {
+            activeOrigin = 'https://vixsrc.to';
+        } else if (targetUrl.hostname.includes('vidlink') || targetUrl.hostname.includes('suubmon') || targetUrl.hostname.includes('hakunaymatata')) {
+            activeOrigin = 'https://vidlink.pro';
+        }
+
+        const client = targetUrl.protocol === 'https:' ? https : http;
+        const reqHeaders = {
+            'Host': targetUrl.hostname,
+            'Origin': activeOrigin,
+            'Referer': activeOrigin + '/',
+            'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': '*/*',
+            'Accept-Encoding': 'identity'
+        };
+
+        if (req.headers['range']) {
+            reqHeaders['Range'] = req.headers['range'];
+        }
+
+        const options = {
+            hostname: targetUrl.hostname,
+            port: targetUrl.port || (targetUrl.protocol === 'https:' ? 443 : 80),
+            path: targetUrl.pathname + targetUrl.search,
+            method: req.method,
+            headers: reqHeaders,
+        };
+
+        const proxy = client.request(options, (streamRes) => {
+            const contentType = streamRes.headers['content-type'] || '';
+            const isM3u8 = targetUrl.pathname.endsWith('.m3u8') || contentType.includes('mpegurl') || contentType.includes('m3u8');
+
+            if (isM3u8 && streamRes.statusCode === 200) {
+                // Buffer m3u8 playlist and rewrite chunk URLs through /proxy-stream
+                let body = '';
+                streamRes.setEncoding('utf8');
+                streamRes.on('data', chunk => body += chunk);
+                streamRes.on('end', () => {
+                    const baseUrl = targetUrl.origin + targetUrl.pathname.substring(0, targetUrl.pathname.lastIndexOf('/') + 1);
+
+                    const rewritten = body.split('\n').map(line => {
+                        const trimmed = line.trim();
+                        if (!trimmed || trimmed.startsWith('#')) return line;
+
+                        let resolvedUrl;
+                        if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+                            resolvedUrl = trimmed;
+                        } else if (trimmed.startsWith('/')) {
+                            resolvedUrl = targetUrl.origin + trimmed;
+                        } else {
+                            resolvedUrl = baseUrl + trimmed;
+                        }
+
+                        return `/proxy-stream?url=${encodeURIComponent(resolvedUrl)}`;
+                    }).join('\n');
+
+                    res.writeHead(200, {
+                        'Content-Type': 'application/vnd.apple.mpegurl',
+                        'Access-Control-Allow-Origin': '*',
+                        'Cache-Control': 'no-cache',
+                    });
+                    res.end(rewritten);
+                });
+            } else {
+                // Pipe binary video chunks (.ts / .mp4 / .m4s) directly to player
+                const outHeaders = {
+                    'Content-Type': contentType || 'video/MP2T',
+                    'Access-Control-Allow-Origin': '*',
+                    'Accept-Ranges': streamRes.headers['accept-ranges'] || 'bytes',
+                };
+                if (streamRes.headers['content-length']) outHeaders['Content-Length'] = streamRes.headers['content-length'];
+                if (streamRes.headers['content-range']) outHeaders['Content-Range'] = streamRes.headers['content-range'];
+
+                res.writeHead(streamRes.statusCode, outHeaders);
+                streamRes.pipe(res);
+            }
+        });
+
+        proxy.on('error', (err) => {
+            res.writeHead(502, { 'Content-Type': 'text/plain' });
+            res.end('Proxy error: ' + err.message);
+        });
+
+        req.pipe(proxy);
+        return;
+    }
