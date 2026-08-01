@@ -433,6 +433,38 @@ async function vidukiRaceServers(pathBase, servers) {
 }
 
 /**
+ * Diagnostic: hit an echo service to see which headers CF Workers actually
+ * forward on outgoing fetch — Origin is a "forbidden request header" per the
+ * Fetch spec, and Workers may strip it. If yes, viduki's ALTCHA endpoint is
+ * unreachable via a plain CF fetch and we need a workaround.
+ */
+async function handleHeadersDiag() {
+  const attempts = [];
+  // Standard init.headers object
+  attempts.push({ label: 'obj', headers: { 'Origin': 'https://www.viduki.net', 'X-Custom': 'yes' } });
+  // Headers() constructor with array
+  const h1 = new Headers();
+  h1.set('Origin', 'https://www.viduki.net');
+  h1.set('X-Custom', 'yes');
+  attempts.push({ label: 'Headers.set', headers: h1 });
+  // Try appending via array of pairs
+  const h2 = new Headers([['Origin', 'https://www.viduki.net'], ['X-Custom', 'yes']]);
+  attempts.push({ label: 'Headers[[]]', headers: h2 });
+
+  const results = [];
+  for (const a of attempts) {
+    try {
+      const r = await fetch('https://httpbin.org/headers', { headers: a.headers });
+      const j = await r.json();
+      results.push({ label: a.label, seenOrigin: j.headers.Origin || null, seenCustom: j.headers['X-Custom'] || null });
+    } catch (e) {
+      results.push({ label: a.label, error: e.message });
+    }
+  }
+  return new Response(JSON.stringify(results, null, 2), { status: 200, headers: CORS_HEADERS });
+}
+
+/**
  * Diagnostic: fetch the ALTCHA challenge from the edge, then try to solve it
  * WITHOUT the parallel race — surfaces the exact challenge shape + whether
  * the SHA-256 loop finds a match. Delete after debug.
@@ -662,6 +694,7 @@ export default {
     if (url.pathname.startsWith('/viduki/')) return handleViduki(url);
     if (url.pathname.startsWith('/flicky/')) return handleFlicky(url);
     if (url.pathname === '/diag/viduki') return handleVidukiDiag();
+    if (url.pathname === '/diag/headers') return handleHeadersDiag();
     return handleTrybox(url);
   }
 };
