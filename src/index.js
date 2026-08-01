@@ -272,7 +272,14 @@ function vidukiEnsureWasm() {
 }
 
 async function vidukiGet(url, extra = {}) {
-  const res = await fetch(url, { headers: { ...VIDUKI_SPOOF, ...extra } });
+  // Origin is a "forbidden" fetch header per spec and CF Workers only forward
+  // it when set via `new Headers()`, not via a plain object. Without Origin,
+  // api.viduki.net returns a decoy `{stream: {url: hls-cdn77...}}` payload
+  // that has nothing to do with the requested route. Using the Headers
+  // constructor is the only way through.
+  const h = new Headers();
+  for (const [k, v] of Object.entries({ ...VIDUKI_SPOOF, ...extra })) h.set(k, v);
+  const res = await fetch(url, { headers: h });
   const body = await res.text();
   return { status: res.status, body };
 }
@@ -401,14 +408,12 @@ async function vidukiFetchEnvelope(pathAndQuery) {
  */
 async function vidukiVerifyUrl(url) {
   try {
-    const res = await fetch(url, {
-      headers: {
-        'Origin': 'https://www.viduki.net',
-        'Referer': 'https://www.viduki.net/',
-        'User-Agent': VIDUKI_SPOOF['User-Agent'],
-        'Accept': '*/*'
-      }
-    });
+    const h = new Headers();
+    h.set('Origin', 'https://www.viduki.net');
+    h.set('Referer', 'https://www.viduki.net/');
+    h.set('User-Agent', VIDUKI_SPOOF['User-Agent']);
+    h.set('Accept', '*/*');
+    const res = await fetch(url, { headers: h });
     if (!res.ok) return false;
     const text = (await res.text()).trimStart();
     return text.startsWith('#EXTM3U');
@@ -568,7 +573,13 @@ function flickyReadString(inst, ptr) {
 }
 
 async function flickyGet(url, extra = {}) {
-  const res = await fetch(url, { headers: { ...FLICKY_SPOOF, ...extra } });
+  // Same Origin-strip issue as viduki — use Headers() constructor so the
+  // Origin header actually makes it out of the Worker. (Flicky was working
+  // by luck because its API tolerates a missing Origin, but keeping this
+  // consistent avoids a future regression.)
+  const h = new Headers();
+  for (const [k, v] of Object.entries({ ...FLICKY_SPOOF, ...extra })) h.set(k, v);
+  const res = await fetch(url, { headers: h });
   const body = await res.text();
   return { status: res.status, body };
 }
