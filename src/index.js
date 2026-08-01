@@ -432,6 +432,38 @@ async function vidukiRaceServers(pathBase, servers) {
   return Promise.any(attempts);
 }
 
+/**
+ * Diagnostic: fetch the ALTCHA challenge from the edge, then try to solve it
+ * WITHOUT the parallel race — surfaces the exact challenge shape + whether
+ * the SHA-256 loop finds a match. Delete after debug.
+ */
+async function handleVidukiDiag() {
+  const t0 = Date.now();
+  const out = { steps: [] };
+  try {
+    const r = await vidukiGet('https://api.viduki.net/altcha-challenge');
+    out.steps.push({ step: 'fetch_challenge', status: r.status, bodyLen: r.body.length, bodySample: r.body.slice(0, 200) });
+    if (r.status !== 200) throw new Error('challenge fetch !=200');
+    const c = JSON.parse(r.body);
+    out.steps.push({ step: 'parsed_challenge', keys: Object.keys(c), maxnumber: c.maxnumber, saltLen: (c.salt || '').length });
+    const t1 = Date.now();
+    let solved = null;
+    for (let n = 0; n <= (c.maxnumber || 200000); n++) {
+      if (sha256Hex(c.salt + n) === c.challenge) { solved = n; break; }
+      if (n === 5) {
+        out.steps.push({ step: 'sample_hash_n=5', hash: sha256Hex(c.salt + '5'), target: c.challenge });
+      }
+    }
+    out.steps.push({ step: 'solve', n: solved, ms: Date.now() - t1 });
+    out.totalMs = Date.now() - t0;
+    return new Response(JSON.stringify(out, null, 2), { status: 200, headers: CORS_HEADERS });
+  } catch (e) {
+    out.error = e.message;
+    out.totalMs = Date.now() - t0;
+    return new Response(JSON.stringify(out, null, 2), { status: 500, headers: CORS_HEADERS });
+  }
+}
+
 async function handleViduki(url) {
   const suffix = url.pathname.slice('/viduki/'.length);
   const parts = suffix.split('/');
@@ -629,6 +661,7 @@ export default {
 
     if (url.pathname.startsWith('/viduki/')) return handleViduki(url);
     if (url.pathname.startsWith('/flicky/')) return handleFlicky(url);
+    if (url.pathname === '/diag/viduki') return handleVidukiDiag();
     return handleTrybox(url);
   }
 };
