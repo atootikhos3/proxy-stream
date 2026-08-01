@@ -16,21 +16,15 @@
  * and play direct from cdn1.1shows.app — the fat video download bypasses the
  * Worker entirely; only the ~1-second resolve does an edge hop.
  *
- * DEPLOY (two-file: dashboard):
- *   1. Workers → streamvault-api → Settings → Bindings → WASM Modules
- *      Add binding named MAKIMA_WASM → upload makima.wasm
- *      Add binding named FLICKY_WASM → upload flicky.wasm
- *   2. Edit code → replace src/index.js with this file → Save & Deploy
- *
- * DEPLOY (wrangler.toml, alternative):
- *   [[rules]] type = "CompiledWasm"  globs = ["**\/*.wasm"]  fallthrough = true
- *   Then `import MAKIMA_WASM from "./makima.wasm"` etc.
- *
- * WHY not base64-inline: Cloudflare Workers disallow WebAssembly.instantiate()
- * on raw bytes at request time ("code generation disallowed by embedder").
- * WASM must arrive as a precompiled WebAssembly.Module — that's what the
- * WASM Module binding is. `new WebAssembly.Instance(MODULE, imports)` is fine.
+ * DEPLOY: `git push` — GitHub Actions calls wrangler-action to publish.
+ * wrangler.jsonc has a [[rules]] entry that tells wrangler to precompile any
+ * .wasm import into a WebAssembly.Module and bundle it into the deploy.
+ * `new WebAssembly.Instance(MAKIMA_WASM, ...)` is allowed at request time
+ * because the compile already happened at build time — only runtime compile
+ * of raw bytes is blocked ("Wasm code generation disallowed by embedder").
  */
+import MAKIMA_WASM from '../makima.wasm';
+import FLICKY_WASM from '../flicky.wasm';
 
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
@@ -234,12 +228,12 @@ function sha256Hex(str) {
   return bytesToHex(sha256(new TextEncoder().encode(str)));
 }
 
-// ─── WASM bindings (uploaded separately in the CF dashboard / wrangler.toml)
-// Each binding surfaces as env.MAKIMA_WASM / env.FLICKY_WASM — precompiled by
-// CF at deploy time, so no runtime compile is needed inside the request
-// handler. `env` is stashed at module scope on the first request so the
-// per-provider ensureWasm() helpers can reach the module refs.
-let __env = null;
+// ─── WASM modules ────────────────────────────────────────────────────────────
+// Imported at top-of-file via `import MAKIMA_WASM from '../makima.wasm'` (see
+// header). Wrangler's [[rules]] CompiledWasm rule turns each import into a
+// precompiled WebAssembly.Module baked into the deploy, so we can call
+// `new WebAssembly.Instance(MODULE, imports)` at request time without ever
+// running WebAssembly.instantiate(bytes) — which CF blocks.
 
 // ─── Viduki (1shows) ─────────────────────────────────────────────────────────
 // Their frontend WASM (makima.wasm) does all crypto. Exports are hashed but
@@ -265,11 +259,9 @@ let vidukiSessionPromise = null;  // in-flight bootstrap
 function vidukiEnsureWasm() {
   if (vidukiWasmPromise) return vidukiWasmPromise;
   vidukiWasmPromise = (async () => {
-    const module = __env && __env.MAKIMA_WASM;
-    if (!module) throw new Error('MAKIMA_WASM binding missing: upload makima.wasm as a WASM Module binding named MAKIMA_WASM');
     // Instantiating from a precompiled Module is allowed at request time;
     // WebAssembly.instantiate(bytes) is not (CF blocks runtime compile).
-    const instance = new WebAssembly.Instance(module, {
+    const instance = new WebAssembly.Instance(MAKIMA_WASM, {
       env: { abort: () => { throw new Error('viduki wasm abort'); } }
     });
     const w = {};
@@ -480,9 +472,7 @@ let flickyWasmPromise = null;
 function flickyEnsureWasm() {
   if (flickyWasmPromise) return flickyWasmPromise;
   flickyWasmPromise = (async () => {
-    const module = __env && __env.FLICKY_WASM;
-    if (!module) throw new Error('FLICKY_WASM binding missing: upload flicky.wasm as a WASM Module binding named FLICKY_WASM');
-    const instance = new WebAssembly.Instance(module, {
+    const instance = new WebAssembly.Instance(FLICKY_WASM, {
       env: { abort: () => { throw new Error('flicky wasm abort'); } }
     });
     return instance;
@@ -634,11 +624,6 @@ async function handleTrybox(url) {
 // ─── Router ──────────────────────────────────────────────────────────────────
 export default {
   async fetch(request, env, ctx) {
-    // Stash env so the WASM-binding lookups inside ensureWasm() can find the
-    // precompiled Modules. Module Workers don't expose bindings as globals —
-    // they only arrive as the env arg to fetch().
-    __env = env;
-
     const url = new URL(request.url);
     if (request.method === 'OPTIONS') return new Response(null, { headers: CORS_HEADERS });
 
