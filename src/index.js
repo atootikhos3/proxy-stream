@@ -638,14 +638,321 @@ async function handleTrybox(url) {
   }
 }
 
+// ─── HLS Proxy with R2 caching ────────────────────────────────────────────────
+// Routes segment/playlist fetches through the Worker with two upsides:
+//   1. CF's IPs are trusted by CDNs (like ironwallnet's TikTok-CDN backing)
+//      that 403 residential ISPs during peak hours.
+//   2. R2 caching: on hit → serve straight from the CF edge (free egress,
+//      15-25 ms typical vs 60-140 ms round-tripping through origin). On miss
+//      → stream from origin, tee the body into R2 while it flows to the
+//      client so the FIRST viewer already populates the cache with no wait.
+//
+// R2 cache key strategy — TryBox's ironwallnet + roomsquare URLs are
+// content-hashed (empirically verified: same tmdbId + same quality returns
+// the exact same base64 blob across hours). So we key by the FULL upstream
+// URL. When TryBox eventually re-encodes and hands us a different blob, R2
+// simply misses and repopulates — no manual invalidation needed.
+//
+// Cacheable if:
+//   - Method is GET
+//   - Not an .m3u8 playlist (tiny, needs rewriting on every serve)
+//   - Not a Range request (partial content — defer to future work)
+// We DON'T host-allowlist any more: the caller (server.js `/proxy-stream`
+// or Android's resolveTryboxCached) only routes to `/hls-proxy` segment URLs
+// that came out of a playlist we already trusted. New TryBox edge domains
+// (wavechill/roomsquare/etc.) get cached without ever touching this file.
+
+// Rewrites relative URIs in an HLS playlist so segment fetches keep going
+// through the Worker with the same referer. Absolute URLs get proxied too so
+// nested playlists (master → variant → segments) all stay on our edge.
+function rewritePlaylist(text, baseUrl, refererParam, workerBase) {
+  const base = new URL(baseUrl);
+  const wrapUrl = (raw) => {
+    let abs;
+    try { abs = new URL(raw, base).toString(); }
+    catch (e) { return raw; }
+    return `${workerBase}/hls-proxy?url=${encodeURIComponent(abs)}`
+      + `&referer=${encodeURIComponent(refererParam)}`;
+  };
+  return text.split(/\r?\n/).map(line => {
+    const t = line.trim();
+    if (!t || t.startsWith('#')) {
+      // Rewrite URI= attributes inside #EXT-X-KEY / #EXT-X-MEDIA / #EXT-X-MAP.
+      return line.replace(/URI="([^"]+)"/g, (_, u) => `URI="${wrapUrl(u)}"`);
+    }
+    return wrapUrl(t);
+  }).join('\n');
+}
+
+async function handleHlsProxy(request, url, env, ctx) {
+  const upstream = url.searchParams.get('url');
+  const referer = url.searchParams.get('referer') || SPOOF_ORIGIN + '/';
+  if (!upstream) {
+    return new Response(JSON.stringify({ error: 'need ?url=' }), {
+      status: 400, headers: CORS_HEADERS
+    });
+  }
+
+  let upstreamHost;
+  try { upstreamHost = new URL(upstream).host; }
+  catch (e) {
+    return new Response(JSON.stringify({ error: 'bad url' }), {
+      status: 400, headers: CORS_HEADERS
+    });
+  }
+
+  const isPlaylist = /\.m3u8(\?|$)/i.test(upstream);
+  const hasRange = !!request.headers.get('range');
+  const cacheable = env.HLS_CACHE
+    && !isPlaylist
+    && !hasRange
+    && request.method === 'GET';
+
+  // ── 1. R2 hit path ────────────────────────────────────────────────────────
+  // Key by full URL so content-hashed TryBox blobs deduplicate across viewers.
+  const cacheKey = cacheable ? upstream : null;
+  if (cacheKey) {
+    const obj = await env.HLS_CACHE.get(cacheKey);
+    if (obj) {
+      const h = new Headers({
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'public, max-age=31536000, immutable',
+        'X-Cache': 'R2-HIT',
+        'Content-Type': obj.httpMetadata?.contentType || 'video/mp2t',
+      });
+      if (obj.size) h.set('Content-Length', String(obj.size));
+      return new Response(obj.body, { status: 200, headers: h });
+    }
+  }
+
+  // ── 2. Upstream fetch ────────────────────────────────────────────────────
+  // Rotate through real browser User-Agents so a CDN using UA+IP fingerprint
+  // throttling doesn't accumulate a single-signature history for us. Doesn't
+  // help against pure IP-range throttling, but many origins (including some
+  // TryBox edges) bucket by combo. Picked randomly per request.
+  const UA_POOL = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:133.0) Gecko/20100101 Firefox/133.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15',
+  ];
+  const ACCEPT_LANG_POOL = [
+    'en-US,en;q=0.9',
+    'en-GB,en-US;q=0.9,en;q=0.8',
+    'en-US,en;q=0.9,es;q=0.8',
+    'en-CA,en-US;q=0.9,en;q=0.8',
+  ];
+  const pickedUa = UA_POOL[Math.floor(Math.random() * UA_POOL.length)];
+  const pickedLang = ACCEPT_LANG_POOL[Math.floor(Math.random() * ACCEPT_LANG_POOL.length)];
+
+  const upstreamHeaders = {
+    'Accept': '*/*',
+    'Accept-Language': pickedLang,
+    'User-Agent': pickedUa,
+    'Referer': referer,
+    'Origin': new URL(referer).origin,
+  };
+  const rangeHeader = request.headers.get('range');
+  if (rangeHeader) upstreamHeaders['Range'] = rangeHeader;
+
+  const upstreamRes = await fetch(upstream, {
+    method: 'GET',
+    headers: upstreamHeaders,
+    // cf.cacheEverything lets CF's L1 also cache — belt & braces with R2.
+    cf: { cacheEverything: true, cacheTtl: 86400 }
+  });
+
+  // Playlist responses: buffer, rewrite segment URIs, serve. Small enough
+  // to buffer without memory concern (playlists max out ~200 KB).
+  if (isPlaylist && upstreamRes.ok) {
+    const text = await upstreamRes.text();
+    const workerBase = `${url.protocol}//${url.host}`;
+    const rewritten = rewritePlaylist(text, upstream, referer, workerBase);
+    return new Response(rewritten, {
+      status: 200,
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'no-store',
+        'Content-Type': 'application/vnd.apple.mpegurl',
+        'X-Cache': 'MISS-PLAYLIST',
+      }
+    });
+  }
+
+  // ── 3. Segment miss path — stream to client AND tee into R2 ──────────────
+  const status = upstreamRes.status;
+  const outHeaders = new Headers({
+    'Access-Control-Allow-Origin': '*',
+    'Cache-Control': status === 200 ? 'public, max-age=31536000, immutable' : 'no-store',
+    'X-Cache': cacheKey ? (status === 200 ? 'MISS-STORING' : 'MISS-NOSTORE') : 'BYPASS',
+  });
+  ['content-type', 'content-length', 'content-range', 'accept-ranges'].forEach(k => {
+    const v = upstreamRes.headers.get(k);
+    if (v) outHeaders.set(k, v);
+  });
+
+  if (!upstreamRes.body) {
+    return new Response(null, { status, headers: outHeaders });
+  }
+
+  // Only tee to R2 on cacheable 200 responses. 206/416 stay pass-through.
+  if (!cacheKey || status !== 200) {
+    return new Response(upstreamRes.body, { status, headers: outHeaders });
+  }
+
+  const [toClient, toR2] = upstreamRes.body.tee();
+  const contentType = upstreamRes.headers.get('content-type') || 'video/mp2t';
+  // ctx.waitUntil keeps the R2 write alive after the client gets EOF, so a
+  // fast viewer who closes the tab doesn't kill the cache population.
+  // Post-write, we also do an inline byte-cap check — real-time defense in
+  // case cron misses runs and the bucket balloons between scheduled sweeps.
+  // Runs in waitUntil so it doesn't add response latency.
+  ctx.waitUntil(
+    env.HLS_CACHE.put(cacheKey, toR2, {
+      httpMetadata: { contentType, cacheControl: 'public, max-age=31536000' }
+    })
+      .then(() => enforceBudget(env))
+      .catch(err => console.error('R2 put or budget check failed', cacheKey, err.message))
+  );
+  return new Response(toClient, { status: 200, headers: outHeaders });
+}
+
+// Post-write byte-cap guard — quick list of the bucket, if total > cap,
+// delete oldest until under. Runs after every MISS-STORING so a runaway
+// prefetch loop can't push us past 10 GB between cron runs. Free tier
+// budget: 1M Class A ops/mo. Rough load: ~600 writes/hour of playback +
+// 600 lists = ~28k ops/day = 850k/mo. Under limit.
+async function enforceBudget(env) {
+  const maxBytes = parseInt(env.CACHE_MAX_BYTES, 10) || (8 * 1024 * 1024 * 1024);
+  const all = [];
+  let cursor;
+  do {
+    const page = await env.HLS_CACHE.list({ limit: 1000, cursor });
+    for (const o of page.objects) all.push(o);
+    cursor = page.truncated ? page.cursor : null;
+  } while (cursor);
+  let total = all.reduce((s, o) => s + (o.size || 0), 0);
+  if (total <= maxBytes) return;
+  const oldestFirst = all.slice().sort((a, b) => a.uploaded - b.uploaded);
+  for (const o of oldestFirst) {
+    if (total <= maxBytes) break;
+    await env.HLS_CACHE.delete(o.key).catch(err =>
+      console.error('inline evict failed', o.key, err.message));
+    total -= (o.size || 0);
+  }
+}
+
+// ─── R2 rolling-window eviction ──────────────────────────────────────────────
+// Cron fires every 5 min (see wrangler.toml [triggers]). Lists everything in
+// HLS_CACHE and deletes objects whose `uploaded` timestamp is older than
+// CACHE_TTL_MIN minutes. Default 15 min — active playback needs ~30s of
+// buffer + some rewind room, 15 min covers that plus a healthy safety margin.
+// Tune via env var CACHE_TTL_MIN without redeploying: `wrangler secret put`.
+//
+// R2 list is paginated at 1000/page. A typical rolling window contains a few
+// hundred segments per active viewer, so one page is nearly always enough,
+// but we loop just in case. Each list is 1 Class A op; deletes are Class B.
+// At 5 min cadence = 288 lists/day = free-tier trivial.
+//
+// Bonus: also enforces a hard SIZE ceiling. If total bytes exceeds
+// CACHE_MAX_BYTES (default 8 GB — under 10 GB free tier, room for the
+// current in-flight writes), we delete the oldest until under the cap.
+async function evictR2(env) {
+  const bucket = env.HLS_CACHE;
+  if (!bucket) return { skipped: 'no R2 binding' };
+
+  const ttlMin = parseInt(env.CACHE_TTL_MIN, 10) || 15;
+  const maxBytes = parseInt(env.CACHE_MAX_BYTES, 10) || (8 * 1024 * 1024 * 1024);
+  const cutoff = Date.now() - ttlMin * 60 * 1000;
+
+  const all = [];
+  let cursor;
+  do {
+    const page = await bucket.list({ limit: 1000, cursor });
+    for (const o of page.objects) all.push(o);
+    cursor = page.truncated ? page.cursor : null;
+  } while (cursor);
+
+  // 1. Age-based eviction — drop anything past the rolling window.
+  const stale = all.filter(o => o.uploaded.getTime() < cutoff);
+  await Promise.all(stale.map(o =>
+    bucket.delete(o.key).catch(err => console.error('delete failed', o.key, err.message))
+  ));
+
+  // 2. Size-based eviction — if we're still over the cap after age eviction,
+  //    keep deleting oldest until under. Rare, but a safety net for weird
+  //    edge cases (bug, huge segment, cron skipped a run).
+  const remaining = all.filter(o => o.uploaded.getTime() >= cutoff);
+  let totalBytes = remaining.reduce((s, o) => s + (o.size || 0), 0);
+  const oldestFirst = remaining.slice().sort((a, b) => a.uploaded - b.uploaded);
+  const overflowDeleted = [];
+  for (const o of oldestFirst) {
+    if (totalBytes <= maxBytes) break;
+    await bucket.delete(o.key).catch(err => console.error('overflow del failed', o.key, err.message));
+    totalBytes -= (o.size || 0);
+    overflowDeleted.push(o.key);
+  }
+
+  return {
+    scanned: all.length,
+    ageEvicted: stale.length,
+    overflowEvicted: overflowDeleted.length,
+    remainingBytes: totalBytes,
+    remainingObjects: all.length - stale.length - overflowDeleted.length,
+    ttlMinutes: ttlMin,
+    capBytes: maxBytes
+  };
+}
+
 // ─── Router ──────────────────────────────────────────────────────────────────
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (request.method === 'OPTIONS') return new Response(null, { headers: CORS_HEADERS });
 
+    if (url.pathname === '/hls-proxy') return handleHlsProxy(request, url, env, ctx);
+    // Manual trigger for debugging + on-demand purge. Returns the same stats
+    // the cron would log so we can verify eviction from curl.
+    if (url.pathname === '/r2/evict') {
+      const stats = await evictR2(env);
+      return new Response(JSON.stringify(stats), {
+        status: 200, headers: CORS_HEADERS
+      });
+    }
+    // Quick health check on R2 usage — handy for the eventual "library" UI.
+    if (url.pathname === '/r2/stats') {
+      const all = [];
+      let cursor;
+      do {
+        const page = await env.HLS_CACHE.list({ limit: 1000, cursor });
+        for (const o of page.objects) all.push({ key: o.key, size: o.size, uploaded: o.uploaded });
+        cursor = page.truncated ? page.cursor : null;
+      } while (cursor);
+      const totalBytes = all.reduce((s, o) => s + (o.size || 0), 0);
+      return new Response(JSON.stringify({
+        objects: all.length,
+        totalBytes,
+        totalMB: (totalBytes / 1024 / 1024).toFixed(1),
+        oldest: all.length ? all.reduce((a, b) => a.uploaded < b.uploaded ? a : b).uploaded : null,
+        newest: all.length ? all.reduce((a, b) => a.uploaded > b.uploaded ? a : b).uploaded : null,
+      }), { status: 200, headers: CORS_HEADERS });
+    }
     if (url.pathname.startsWith('/viduki/')) return handleViduki(url);
     if (url.pathname.startsWith('/flicky/')) return handleFlicky(url);
     return handleTrybox(url);
+  },
+
+  // Cron entry point — see wrangler.toml [triggers.crons]. Wrapped in
+  // waitUntil so a slow evict doesn't kill the invocation limit; result is
+  // logged so `wrangler tail` shows stats after each run.
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil((async () => {
+      const stats = await evictR2(env);
+      console.log('[cron] evict', event.scheduledTime, JSON.stringify(stats));
+    })());
   }
 };

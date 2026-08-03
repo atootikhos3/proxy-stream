@@ -14,5 +14,19 @@
   // blocked at runtime).
   "rules": [
     { "type": "CompiledWasm", "globs": ["**/*.wasm"], "fallthrough": true }
-  ]
+  ],
+  // R2 bucket for HLS segment caching (AtootiStream Cache path). See
+  // handleHlsProxy in src/index.js.
+  "r2_buckets": [
+    { "binding": "HLS_CACHE", "bucket_name": "atooti-hls-cache" }
+  ],
+  // Rolling-window eviction cron: every 5 min, drop objects older than
+  // CACHE_TTL_MIN, then clamp total size below CACHE_MAX_BYTES.
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  },
+  "vars": {
+    "CACHE_TTL_MIN": "30",
+    "CACHE_MAX_BYTES": "8589934592"
+  }
 }
