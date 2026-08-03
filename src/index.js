@@ -908,6 +908,125 @@ async function evictR2(env) {
   };
 }
 
+// ─── Mapplee proxy ───────────────────────────────────────────────────────────
+// Thin CORS-friendly relay for the three mapplee endpoints the client needs.
+// The PoW between step 2 and step 4 runs in the CLIENT (SubtleCrypto), not
+// here — Worker CPU limits would blow on a 300-800ms mining loop, and the
+// browser/WebView native SHA-256 impl is faster than we'd be anyway.
+//
+// Routes:
+//   GET  /mapplee/page?tmdb=X&type=movie|tv[&season=X&episode=Y]
+//        → { requestToken, subtitles: [...] }
+//   POST /mapplee/handshake
+//        body: { mediaId, mediaType, requestToken[, pow] }
+//        → verbatim mapplee response (either { pow: {...} } or { token })
+//   GET  /mapplee/stream?mediaId=…&mediaType=…&requestToken=…&token=…
+//        → { stream_url }
+//
+// All requests forward Referer: https://mapplee.com/ per mapplee expectation.
+async function handleMapplee(request, url) {
+  const MAPPLEE = 'https://mapplee.com';
+  const REFERER = 'https://mapplee.com/';
+  const path = url.pathname.slice('/mapplee'.length);
+  const cors = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': '*',
+    'Content-Type': 'application/json'
+  };
+
+  try {
+    // GET /mapplee/page — fetch the watch page HTML, extract __REQUEST_TOKEN__.
+    if (path === '/page') {
+      const tmdb = url.searchParams.get('tmdb');
+      const type = url.searchParams.get('type') || 'movie';
+      if (!tmdb) {
+        return new Response(JSON.stringify({ error: 'need tmdb' }), { status: 400, headers: cors });
+      }
+      let watchPath;
+      if (type === 'tv') {
+        const s = url.searchParams.get('season') || '1';
+        const e = url.searchParams.get('episode') || '1';
+        watchPath = `/watch/tv/${tmdb}/${s}/${e}`;
+      } else {
+        watchPath = `/watch/movie/${tmdb}`;
+      }
+      const res = await fetch(MAPPLEE + watchPath, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml',
+        }
+      });
+      if (!res.ok) {
+        return new Response(JSON.stringify({ error: `page ${res.status}` }), { status: res.status, headers: cors });
+      }
+      const html = await res.text();
+      const m = html.match(/__REQUEST_TOKEN__[^e]*?(eyJ[A-Za-z0-9_.\-]+)/);
+      if (!m) {
+        return new Response(JSON.stringify({ error: 'no __REQUEST_TOKEN__ in page' }), { status: 502, headers: cors });
+      }
+      return new Response(JSON.stringify({ requestToken: m[1] }), { status: 200, headers: cors });
+    }
+
+    // POST /mapplee/handshake — pass through to /api/playback-init.
+    if (path === '/handshake' && request.method === 'POST') {
+      const body = await request.text();
+      const res = await fetch(MAPPLEE + '/api/playback-init', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Referer': REFERER + 'watch/',
+          'Origin': MAPPLEE,
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+        },
+        body
+      });
+      const text = await res.text();
+      return new Response(text, {
+        status: res.status,
+        headers: { ...cors, 'Content-Type': res.headers.get('content-type') || 'application/json' }
+      });
+    }
+
+    // GET /mapplee/stream — pass through to /api/stream, forward all mapplee
+    // query params through. Returns the JSON with stream_url.
+    if (path === '/stream') {
+      const passed = new URLSearchParams(url.searchParams);
+      // Mapplee expects specific query names; ensure required ones are present.
+      passed.set('source', 'mapple');
+      passed.set('apikey', 'mptv_sk_a8f29c4e7b3d1f');
+      const res = await fetch(MAPPLEE + '/api/stream?' + passed.toString(), {
+        headers: {
+          'Referer': REFERER,
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+        }
+      });
+      const text = await res.text();
+      return new Response(text, {
+        status: res.status,
+        headers: { ...cors, 'Content-Type': res.headers.get('content-type') || 'application/json' }
+      });
+    }
+
+    // Fallback: probe endpoint that just returns "reachable from Worker" info.
+    if (path === '/probe') {
+      const res = await fetch(MAPPLEE + '/', {
+        headers: { 'User-Agent': 'Mozilla/5.0 (probe)' }
+      });
+      return new Response(JSON.stringify({
+        status: res.status,
+        ok: res.ok,
+        server: res.headers.get('server'),
+        cfMitigated: res.headers.get('cf-mitigated'),
+      }), { status: 200, headers: cors });
+    }
+
+    return new Response(JSON.stringify({ error: 'unknown /mapplee route' }), { status: 404, headers: cors });
+  } catch (e) {
+    return new Response(JSON.stringify({ error: e.message || String(e) }), { status: 500, headers: cors });
+  }
+}
+
 // ─── Router ──────────────────────────────────────────────────────────────────
 export default {
   async fetch(request, env, ctx) {
@@ -941,6 +1060,7 @@ export default {
         newest: all.length ? all.reduce((a, b) => a.uploaded > b.uploaded ? a : b).uploaded : null,
       }), { status: 200, headers: CORS_HEADERS });
     }
+    if (url.pathname.startsWith('/mapplee/')) return handleMapplee(request, url);
     if (url.pathname.startsWith('/viduki/')) return handleViduki(url);
     if (url.pathname.startsWith('/flicky/')) return handleFlicky(url);
     return handleTrybox(url);
