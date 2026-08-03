@@ -701,10 +701,15 @@ async function handleHlsProxy(request, url, env, ctx) {
     });
   }
 
-  const isPlaylist = /\.m3u8(\?|$)/i.test(upstream);
+  // Playlists detected by URL extension only up front — some providers use
+  // opaque URLs (mapplee's source.heistotron.uk/p/{blob} serves both playlist
+  // and segment with the same URL shape). We re-check by Content-Type on the
+  // upstream response below and jump back into the rewrite path if needed.
+  const isPlaylistByUrl = /\.m3u8(\?|$)/i.test(upstream);
   const hasRange = !!request.headers.get('range');
+  // Provisional cacheability — refined once we know the content type.
   const cacheable = env.HLS_CACHE
-    && !isPlaylist
+    && !isPlaylistByUrl
     && !hasRange
     && request.method === 'GET';
 
@@ -714,6 +719,28 @@ async function handleHlsProxy(request, url, env, ctx) {
   if (cacheKey) {
     const obj = await env.HLS_CACHE.get(cacheKey);
     if (obj) {
+      // Rescue path: if we previously (mistakenly) cached a playlist as a
+      // "segment" because its URL didn't end in .m3u8 (mapplee's opaque
+      // /p/{blob} URLs), re-detect via stored content-type and re-run the
+      // playlist rewrite so segment URIs inside still point at the Worker.
+      // Delete the bad entry so next fetch stores fresh.
+      const cachedCT = (obj.httpMetadata?.contentType || '').toLowerCase();
+      if (cachedCT.includes('mpegurl')) {
+        const text = await obj.text();
+        const workerBase = `${url.protocol}//${url.host}`;
+        const rewritten = rewritePlaylist(text, upstream, referer, workerBase);
+        // Drop the mis-cached playlist so this doesn't recur.
+        ctx.waitUntil(env.HLS_CACHE.delete(cacheKey).catch(() => {}));
+        return new Response(rewritten, {
+          status: 200,
+          headers: {
+            'Access-Control-Allow-Origin': '*',
+            'Cache-Control': 'no-store',
+            'Content-Type': 'application/vnd.apple.mpegurl',
+            'X-Cache': 'R2-HIT-PLAYLIST-REWRITE',
+          }
+        });
+      }
       const h = new Headers({
         'Access-Control-Allow-Origin': '*',
         'Cache-Control': 'public, max-age=31536000, immutable',
@@ -765,6 +792,14 @@ async function handleHlsProxy(request, url, env, ctx) {
     // cf.cacheEverything lets CF's L1 also cache — belt & braces with R2.
     cf: { cacheEverything: true, cacheTtl: 86400 }
   });
+
+  // Playlist detection — either URL says .m3u8, or the upstream advertised
+  // an HLS mime type. Second check catches mapplee's opaque /p/{blob} URLs
+  // that serve BOTH playlist and segment with the same URL shape but
+  // different content-type.
+  const upstreamCT = (upstreamRes.headers.get('content-type') || '').toLowerCase();
+  const isPlaylistByType = upstreamCT.includes('mpegurl');
+  const isPlaylist = isPlaylistByUrl || isPlaylistByType;
 
   // Playlist responses: buffer, rewrite segment URIs, serve. Small enough
   // to buffer without memory concern (playlists max out ~200 KB).
