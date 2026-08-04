@@ -847,26 +847,31 @@ async function handleHlsProxy(request, url, env, ctx) {
     return new Response(null, { status, headers: outHeaders });
   }
 
-  // Only tee to R2 on cacheable 200 responses. 206/416 stay pass-through.
+  // Only cache on 200 responses. 206/416 stay pass-through.
   if (!cacheKey || status !== 200) {
     return new Response(upstreamRes.body, { status, headers: outHeaders });
   }
 
-  const [toClient, toR2] = upstreamRes.body.tee();
+  // Buffer the segment body once, then serve from the buffer AND store in R2.
+  // Reason: `upstreamRes.body.tee()` gives us two ReadableStreams neither of
+  // which carries a known length, and R2.put requires a fixed-length body
+  // ("Provided readable stream must have a known length"). Buffering to an
+  // ArrayBuffer sidesteps that entirely — R2 gets a byte array of known
+  // length, and the client gets the same bytes with the real content-length
+  // header. Costs ~20-50ms first-fetch latency for a 3 MB segment (buffered
+  // fully before response starts) but every follow-up fetch hits R2 in the
+  // R2-HIT branch above, so wall-clock across a session is much better.
+  const bodyBuf = await upstreamRes.arrayBuffer();
   const contentType = upstreamRes.headers.get('content-type') || 'video/mp2t';
-  // ctx.waitUntil keeps the R2 write alive after the client gets EOF, so a
-  // fast viewer who closes the tab doesn't kill the cache population.
-  // Post-write, we also do an inline byte-cap check — real-time defense in
-  // case cron misses runs and the bucket balloons between scheduled sweeps.
-  // Runs in waitUntil so it doesn't add response latency.
+  outHeaders.set('Content-Length', String(bodyBuf.byteLength));
   ctx.waitUntil(
-    env.HLS_CACHE.put(cacheKey, toR2, {
+    env.HLS_CACHE.put(cacheKey, bodyBuf, {
       httpMetadata: { contentType, cacheControl: 'public, max-age=31536000' }
     })
       .then(() => enforceBudget(env))
       .catch(err => console.error('R2 put or budget check failed', cacheKey, err.message))
   );
-  return new Response(toClient, { status: 200, headers: outHeaders });
+  return new Response(bodyBuf, { status: 200, headers: outHeaders });
 }
 
 // Post-write byte-cap guard — quick list of the bucket, if total > cap,
