@@ -686,7 +686,6 @@ function rewritePlaylist(text, baseUrl, refererParam, workerBase) {
 
 async function handleHlsProxy(request, url, env, ctx) {
   const upstream = url.searchParams.get('url');
-  const referer = url.searchParams.get('referer') || SPOOF_ORIGIN + '/';
   if (!upstream) {
     return new Response(JSON.stringify({ error: 'need ?url=' }), {
       status: 400, headers: CORS_HEADERS
@@ -699,6 +698,20 @@ async function handleHlsProxy(request, url, env, ctx) {
     return new Response(JSON.stringify({ error: 'bad url' }), {
       status: 400, headers: CORS_HEADERS
     });
+  }
+
+  // Resolve the Referer to forward upstream. Callers usually pass one via
+  // `?referer=`, but as a safety net we default known hosts to the Referer
+  // the origin requires — Mapplee's heistotron.uk edges 403 without a
+  // mapplee.com Referer, for example. Falls back to the generic TryBox
+  // spoof only if the host is unknown.
+  let referer = url.searchParams.get('referer');
+  if (!referer) {
+    if (/(^|\.)(heistotron\.uk|mapplee\.com)$/i.test(upstreamHost)) {
+      referer = 'https://mapplee.com/';
+    } else {
+      referer = SPOOF_ORIGIN + '/';
+    }
   }
 
   // Playlists detected by URL extension only up front — some providers use
