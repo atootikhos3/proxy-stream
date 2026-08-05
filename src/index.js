@@ -689,13 +689,8 @@ function rewritePlaylist(text, baseUrl, refererParam, workerBase) {
 // normal HTTP URL that serves the rewritten playlist. This avoids file:// local
 // playlists entirely while still routing all heavy segment traffic through
 // /hls-proxy → Cloudflare → R2.
-const HOSTED_PLAYLISTS = new Map();
 const HOSTED_PLAYLIST_TTL_MS = 30 * 60 * 1000;
-function gcHostedPlaylists(now) {
-  for (const [k, v] of HOSTED_PLAYLISTS) {
-    if (!v || !v.expiresAt || v.expiresAt <= now) HOSTED_PLAYLISTS.delete(k);
-  }
-}
+const HOSTED_PLAYLIST_PREFIX = 'playlist-host:';
 function makeHostedPlaylistId() {
   const bytes = new Uint8Array(12);
   crypto.getRandomValues(bytes);
@@ -704,8 +699,13 @@ function makeHostedPlaylistId() {
 
 async function handleHostedPlaylist(request, url, env, ctx) {
   const now = Date.now();
-  gcHostedPlaylists(now);
   const workerBase = `${url.protocol}//${url.host}`;
+
+  if (!env.HLS_CACHE) {
+    return new Response(JSON.stringify({ error: 'HLS_CACHE binding missing' }), {
+      status: 500, headers: CORS_HEADERS
+    });
+  }
 
   if (request.method === 'POST') {
     let body;
@@ -721,11 +721,16 @@ async function handleHostedPlaylist(request, url, env, ctx) {
     }
     const rewritten = rewritePlaylist(text, baseUrl, referer, workerBase);
     const id = makeHostedPlaylistId();
-    HOSTED_PLAYLISTS.set(id, {
-      body: rewritten,
-      expiresAt: now + HOSTED_PLAYLIST_TTL_MS,
-      referer,
-      baseUrl
+    const key = HOSTED_PLAYLIST_PREFIX + id;
+    await env.HLS_CACHE.put(key, rewritten, {
+      httpMetadata: {
+        contentType: 'application/vnd.apple.mpegurl',
+        cacheControl: 'no-store'
+      },
+      customMetadata: {
+        kind: 'hosted-playlist',
+        expiresAt: String(now + HOSTED_PLAYLIST_TTL_MS)
+      }
     });
     return new Response(JSON.stringify({
       id,
@@ -741,17 +746,22 @@ async function handleHostedPlaylist(request, url, env, ctx) {
   if (!m) {
     return new Response(JSON.stringify({ error: 'bad playlist path' }), { status: 400, headers: CORS_HEADERS });
   }
-  const entry = HOSTED_PLAYLISTS.get(m[1]);
-  if (!entry || entry.expiresAt <= now) {
-    HOSTED_PLAYLISTS.delete(m[1]);
+  const key = HOSTED_PLAYLIST_PREFIX + m[1];
+  const obj = await env.HLS_CACHE.get(key);
+  if (!obj) {
     return new Response(JSON.stringify({ error: 'playlist expired' }), { status: 404, headers: CORS_HEADERS });
   }
-  return new Response(entry.body, {
+  const exp = Number((obj.customMetadata && obj.customMetadata.expiresAt) || 0);
+  if (exp && exp <= now) {
+    ctx.waitUntil(env.HLS_CACHE.delete(key).catch(() => {}));
+    return new Response(JSON.stringify({ error: 'playlist expired' }), { status: 404, headers: CORS_HEADERS });
+  }
+  return new Response(obj.body, {
     status: 200,
     headers: {
       'Access-Control-Allow-Origin': '*',
       'Cache-Control': 'no-store',
-      'Content-Type': 'application/vnd.apple.mpegurl',
+      'Content-Type': obj.httpMetadata?.contentType || 'application/vnd.apple.mpegurl',
       'X-Cache': 'HOSTED-PLAYLIST'
     }
   });
