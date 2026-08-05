@@ -684,6 +684,79 @@ function rewritePlaylist(text, baseUrl, refererParam, workerBase) {
   }).join('\n');
 }
 
+// Hosted rewritten playlists for Android Mapplee: the device (residential IP)
+// fetches the upstream master/variant text, POSTs it here, and receives back a
+// normal HTTP URL that serves the rewritten playlist. This avoids file:// local
+// playlists entirely while still routing all heavy segment traffic through
+// /hls-proxy → Cloudflare → R2.
+const HOSTED_PLAYLISTS = new Map();
+const HOSTED_PLAYLIST_TTL_MS = 30 * 60 * 1000;
+function gcHostedPlaylists(now) {
+  for (const [k, v] of HOSTED_PLAYLISTS) {
+    if (!v || !v.expiresAt || v.expiresAt <= now) HOSTED_PLAYLISTS.delete(k);
+  }
+}
+function makeHostedPlaylistId() {
+  const bytes = new Uint8Array(12);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function handleHostedPlaylist(request, url, env, ctx) {
+  const now = Date.now();
+  gcHostedPlaylists(now);
+  const workerBase = `${url.protocol}//${url.host}`;
+
+  if (request.method === 'POST') {
+    let body;
+    try { body = await request.json(); }
+    catch (e) {
+      return new Response(JSON.stringify({ error: 'bad json' }), { status: 400, headers: CORS_HEADERS });
+    }
+    const text = body && body.text;
+    const baseUrl = body && body.baseUrl;
+    const referer = (body && body.referer) || 'https://mapplee.com/';
+    if (!text || !baseUrl) {
+      return new Response(JSON.stringify({ error: 'need text + baseUrl' }), { status: 400, headers: CORS_HEADERS });
+    }
+    const rewritten = rewritePlaylist(text, baseUrl, referer, workerBase);
+    const id = makeHostedPlaylistId();
+    HOSTED_PLAYLISTS.set(id, {
+      body: rewritten,
+      expiresAt: now + HOSTED_PLAYLIST_TTL_MS,
+      referer,
+      baseUrl
+    });
+    return new Response(JSON.stringify({
+      id,
+      url: `${workerBase}/playlist-host/${id}.m3u8`,
+      ttlSeconds: Math.floor(HOSTED_PLAYLIST_TTL_MS / 1000)
+    }), {
+      status: 200,
+      headers: CORS_HEADERS
+    });
+  }
+
+  const m = url.pathname.match(/^\/playlist-host\/([a-f0-9]{24})\.m3u8$/i);
+  if (!m) {
+    return new Response(JSON.stringify({ error: 'bad playlist path' }), { status: 400, headers: CORS_HEADERS });
+  }
+  const entry = HOSTED_PLAYLISTS.get(m[1]);
+  if (!entry || entry.expiresAt <= now) {
+    HOSTED_PLAYLISTS.delete(m[1]);
+    return new Response(JSON.stringify({ error: 'playlist expired' }), { status: 404, headers: CORS_HEADERS });
+  }
+  return new Response(entry.body, {
+    status: 200,
+    headers: {
+      'Access-Control-Allow-Origin': '*',
+      'Cache-Control': 'no-store',
+      'Content-Type': 'application/vnd.apple.mpegurl',
+      'X-Cache': 'HOSTED-PLAYLIST'
+    }
+  });
+}
+
 async function handleHlsProxy(request, url, env, ctx) {
   const upstream = url.searchParams.get('url');
   if (!upstream) {
@@ -1087,6 +1160,9 @@ export default {
     if (request.method === 'OPTIONS') return new Response(null, { headers: CORS_HEADERS });
 
     if (url.pathname === '/hls-proxy') return handleHlsProxy(request, url, env, ctx);
+    if (url.pathname === '/playlist-host' || url.pathname.startsWith('/playlist-host/')) {
+      return handleHostedPlaylist(request, url, env, ctx);
+    }
     // Manual trigger for debugging + on-demand purge. Returns the same stats
     // the cron would log so we can verify eviction from curl.
     if (url.pathname === '/r2/evict') {
