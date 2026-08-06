@@ -935,17 +935,50 @@ async function handleHlsProxy(request, url, env, ctx) {
     return new Response(upstreamRes.body, { status, headers: outHeaders });
   }
 
-  // Buffer the segment body once, then serve from the buffer AND store in R2.
-  // Reason: `upstreamRes.body.tee()` gives us two ReadableStreams neither of
-  // which carries a known length, and R2.put requires a fixed-length body
-  // ("Provided readable stream must have a known length"). Buffering to an
-  // ArrayBuffer sidesteps that entirely — R2 gets a byte array of known
-  // length, and the client gets the same bytes with the real content-length
-  // header. Costs ~20-50ms first-fetch latency for a 3 MB segment (buffered
-  // fully before response starts) but every follow-up fetch hits R2 in the
-  // R2-HIT branch above, so wall-clock across a session is much better.
-  const bodyBuf = await upstreamRes.arrayBuffer();
+  // Fast path: stream to the client AND to R2 simultaneously. First byte
+  // arrives at the client as soon as the origin starts sending — no waiting
+  // for the whole segment to buffer.
+  //
+  // Why the earlier `upstreamRes.body.tee()` approach failed:
+  //   R2.put(readableStream, ...) requires a fixed-length source and throws
+  //   "Provided readable stream must have a known length" for a bare tee'd
+  //   branch (Content-Length isn't carried on the tee'd side).
+  //
+  // The fix: tee upstream body into two branches. Pipe the R2 branch
+  // through a FixedLengthStream — that wrapper KNOWS the length (we hand it
+  // the Content-Length from the origin response), so R2 accepts its
+  // .readable side. The client branch stays a raw ReadableStream and
+  // streams normally.
+  //
+  // If the origin didn't return Content-Length (rare — usually chunked
+  // encoding), fall back to buffering via arrayBuffer(). Otherwise we'd
+  // have no way to tell R2 the length up front.
   const contentType = upstreamRes.headers.get('content-type') || 'video/mp2t';
+  const contentLength = upstreamRes.headers.get('content-length');
+
+  if (contentLength && Number(contentLength) > 0) {
+    const length = Number(contentLength);
+    const [toClient, toR2] = upstreamRes.body.tee();
+    const fls = new FixedLengthStream(length);
+    // Pipe the R2 branch into the FixedLengthStream in the background.
+    // ctx.waitUntil keeps this alive after the client-facing Response
+    // returns — otherwise the isolate could tear down mid-write.
+    ctx.waitUntil(toR2.pipeTo(fls.writable).catch(err =>
+      console.error('R2 pipe failed', cacheKey, err.message)
+    ));
+    ctx.waitUntil(
+      env.HLS_CACHE.put(cacheKey, fls.readable, {
+        httpMetadata: { contentType, cacheControl: 'public, max-age=31536000' }
+      })
+        .then(() => enforceBudget(env))
+        .catch(err => console.error('R2 put failed', cacheKey, err.message))
+    );
+    return new Response(toClient, { status: 200, headers: outHeaders });
+  }
+
+  // Chunked-encoding fallback: no Content-Length so we have to buffer.
+  // Slower first-play (~20-50ms extra for a 3 MB segment) but correct.
+  const bodyBuf = await upstreamRes.arrayBuffer();
   outHeaders.set('Content-Length', String(bodyBuf.byteLength));
   ctx.waitUntil(
     env.HLS_CACHE.put(cacheKey, bodyBuf, {
