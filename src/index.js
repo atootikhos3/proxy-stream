@@ -935,6 +935,25 @@ async function handleHlsProxy(request, url, env, ctx) {
     return new Response(upstreamRes.body, { status, headers: outHeaders });
   }
 
+  // Skip R2 caching for progressive-video files (MP4/WebM/MKV etc).
+  // Each 4K MP4 is ~2 GB — caching 4 of them blows the 8 GB R2 cap.
+  // Range requests for these already bypass R2 above (`hasRange` check);
+  // this catches the initial non-Range GET that a video element sometimes
+  // fires. Detected via Content-Type; segment-style content (video/MP2T,
+  // application/octet-stream, "text/plain" for opaque URLs) still gets
+  // cached normally.
+  const upstreamCt = (upstreamRes.headers.get('content-type') || '').toLowerCase();
+  const isProgressiveVideo = /^video\/(mp4|webm|x-matroska|quicktime)/.test(upstreamCt);
+  if (isProgressiveVideo) {
+    return new Response(upstreamRes.body, {
+      status,
+      headers: (() => {
+        outHeaders.set('X-Cache', 'BYPASS-PROGRESSIVE');
+        return outHeaders;
+      })()
+    });
+  }
+
   // Fast path: stream to the client AND to R2 simultaneously. First byte
   // arrives at the client as soon as the origin starts sending — no waiting
   // for the whole segment to buffer.
