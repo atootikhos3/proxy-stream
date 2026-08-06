@@ -23,10 +23,11 @@
   // Rolling-window eviction cron: every 5 min, drop objects older than
   // CACHE_TTL_MIN, then clamp total size below CACHE_MAX_BYTES.
   "triggers": {
-    "crons": ["*/5 * * * *"]
+    "crons": ["*/2 * * * *"]
   },
   "vars": {
-    "CACHE_TTL_MIN": "45",
-    "CACHE_MAX_BYTES": "8589934592"
+    "CACHE_TTL_MIN": "30",
+    "CACHE_MAX_BYTES": "8589934592",
+    "CACHE_EMERGENCY_BYTES": "9126805504"
   }
 }

@@ -990,13 +990,20 @@ async function handleHlsProxy(request, url, env, ctx) {
   return new Response(bodyBuf, { status: 200, headers: outHeaders });
 }
 
-// Post-write byte-cap guard — quick list of the bucket, if total > cap,
-// delete oldest until under. Runs after every MISS-STORING so a runaway
-// prefetch loop can't push us past 10 GB between cron runs. Free tier
-// budget: 1M Class A ops/mo. Rough load: ~600 writes/hour of playback +
-// 600 lists = ~28k ops/day = 850k/mo. Under limit.
+// Post-write byte-cap guard — enforce the 8 GB ceiling in three tiers:
+//   1. Under cap: no-op.
+//   2. Over cap (soft): incremental oldest-first evict until under.
+//   3. Way over (panic, > CACHE_EMERGENCY_BYTES): nuke oldest 50% in one
+//      pass. Should never trigger under normal load — it's a runaway safety
+//      net if a burst of concurrent writes outpaced the incremental path.
+//
+// Runs after every MISS-STORING so R2 stays clamped in real-time; the cron
+// (every 2 min) is belt-and-braces for anything the inline path missed.
+// Free tier: 1M Class A ops/mo. Under real load (~600 writes/hr + 600
+// lists) that's ~14 k ops/day = 420 k/mo — well under limit.
 async function enforceBudget(env) {
   const maxBytes = parseInt(env.CACHE_MAX_BYTES, 10) || (8 * 1024 * 1024 * 1024);
+  const emergency = parseInt(env.CACHE_EMERGENCY_BYTES, 10) || (maxBytes + 512 * 1024 * 1024);
   const all = [];
   let cursor;
   do {
@@ -1006,7 +1013,24 @@ async function enforceBudget(env) {
   } while (cursor);
   let total = all.reduce((s, o) => s + (o.size || 0), 0);
   if (total <= maxBytes) return;
+
   const oldestFirst = all.slice().sort((a, b) => a.uploaded - b.uploaded);
+
+  // Panic path: total ballooned past the emergency threshold — drop the
+  // oldest HALF of the bucket in one Promise.all. Fast recovery, log loudly
+  // so we notice it happened.
+  if (total > emergency) {
+    const half = oldestFirst.slice(0, Math.ceil(oldestFirst.length / 2));
+    const bytesFreed = half.reduce((s, o) => s + (o.size || 0), 0);
+    console.warn('[enforceBudget] PANIC WIPE',
+      { totalBytes: total, emergency, deleting: half.length, bytesFreed });
+    await Promise.all(half.map(o =>
+      env.HLS_CACHE.delete(o.key).catch(err =>
+        console.error('panic evict failed', o.key, err.message))));
+    return;
+  }
+
+  // Normal over-cap: incremental oldest-first.
   for (const o of oldestFirst) {
     if (total <= maxBytes) break;
     await env.HLS_CACHE.delete(o.key).catch(err =>
