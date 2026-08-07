@@ -882,12 +882,50 @@ async function handleHlsProxy(request, url, env, ctx) {
   const rangeHeader = request.headers.get('range');
   if (rangeHeader) upstreamHeaders['Range'] = rangeHeader;
 
-  const upstreamRes = await fetch(upstream, {
-    method: 'GET',
-    headers: upstreamHeaders,
-    // cf.cacheEverything lets CF's L1 also cache — belt & braces with R2.
-    cf: { cacheEverything: true, cacheTtl: 86400 }
-  });
+  // TryBox's segment edges (studyedu.site as of 2026-08, rapidforest before
+  // it) intermittently accept a connection and then trickle at ~4 KB/s — a
+  // 5 MB segment that normally lands in 400 ms takes 90+ seconds. It is
+  // per-request, not per-host: the very next segment usually serves at full
+  // speed. Without a deadline the Worker would sit on that stalled socket and
+  // the player would rebuffer; retrying gets a different edge and almost
+  // always succeeds immediately.
+  //
+  // The timeout bounds time-to-first-byte and the initial read, not the whole
+  // body — a large segment on a healthy connection streams well within it.
+  const UPSTREAM_TIMEOUT_MS = 12000;
+  const fetchUpstream = async () => {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), UPSTREAM_TIMEOUT_MS);
+    try {
+      const r = await fetch(upstream, {
+        method: 'GET',
+        headers: upstreamHeaders,
+        signal: ac.signal,
+        // cf.cacheEverything lets CF's L1 also cache — belt & braces with R2.
+        cf: { cacheEverything: true, cacheTtl: 86400 }
+      });
+      return { res: r, done: () => clearTimeout(timer) };
+    } catch (e) {
+      clearTimeout(timer);
+      throw e;
+    }
+  };
+
+  let upstreamRes, clearUpstreamTimer;
+  try {
+    ({ res: upstreamRes, done: clearUpstreamTimer } = await fetchUpstream());
+  } catch (e) {
+    try {
+      ({ res: upstreamRes, done: clearUpstreamTimer } = await fetchUpstream());
+    } catch (e2) {
+      return new Response(JSON.stringify({ error: 'upstream unreachable: ' + (e2.message || e2) }), {
+        status: 504,
+        headers: { ...CORS_HEADERS, 'X-Cache': 'UPSTREAM-TIMEOUT' }
+      });
+    }
+  }
+  // Headers are in; the body streams on its own and must not be cut off.
+  clearUpstreamTimer();
 
   // Playlist detection — either URL says .m3u8, or the upstream advertised
   // an HLS mime type. Second check catches mapplee's opaque /p/{blob} URLs
@@ -942,8 +980,18 @@ async function handleHlsProxy(request, url, env, ctx) {
   // fires. Detected via Content-Type; segment-style content (video/MP2T,
   // application/octet-stream, "text/plain" for opaque URLs) still gets
   // cached normally.
+  //
+  // Content-Type alone is NOT enough: fMP4 HLS (which TryBox returns on the
+  // restored /vd/ route) serves its `#EXT-X-MAP` init segment as video/mp4
+  // too. That init is ~1 KB and is fetched before every single play, so it
+  // must be cached, not bypassed. Size is the reliable discriminator — a
+  // real progressive movie is hundreds of MB, an fMP4 init/segment is KB.
+  // No Content-Length means we can't size-check, so bypass to stay safe.
   const upstreamCt = (upstreamRes.headers.get('content-type') || '').toLowerCase();
-  const isProgressiveVideo = /^video\/(mp4|webm|x-matroska|quicktime)/.test(upstreamCt);
+  const declaredLen = Number(upstreamRes.headers.get('content-length') || 0);
+  const PROGRESSIVE_MIN_BYTES = 50 * 1024 * 1024;
+  const isProgressiveVideo = /^video\/(mp4|webm|x-matroska|quicktime)/.test(upstreamCt)
+    && (!declaredLen || declaredLen >= PROGRESSIVE_MIN_BYTES);
   if (isProgressiveVideo) {
     return new Response(upstreamRes.body, {
       status,
