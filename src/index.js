@@ -1287,6 +1287,105 @@ async function handleMapplee(request, url) {
   }
 }
 
+// ─── Subtitle proxy: normalise + time-shift ──────────────────────────────────
+// Media3 has no subtitle-offset API, and doing the rewrite on the client meant
+// the TV fetched every track on every play just to inspect headers — enough
+// request volume to get the IP blocked, which is why that path was reverted.
+// Doing it here fetches once, only for the track actually selected, and lets
+// CF's edge cache absorb repeats.
+//
+// Also normalises SubRip to WebVTT. An extension-less URL serving SRT gets
+// labelled text/vtt by the client's mime guess, and ExoPlayer's VTT parser
+// rejects it outright — so this quietly fixes a second failure mode.
+
+// Accepts `HH:MM:SS,mmm`, `HH:MM:SS.mmm` and the short `MM:SS.mmm` VTT form.
+const CUE_TIME = /(?:(\d{1,3}):)?(\d{1,2}):(\d{1,2})[.,](\d{1,3})/g;
+
+function cueToMs(h, m, s, ms) {
+  return (Number(h || 0) * 3600 + Number(m) * 60 + Number(s)) * 1000 + Number(ms.padEnd(3, '0'));
+}
+function msToCue(total) {
+  if (total < 0) total = 0;
+  const ms = total % 1000;
+  const s = Math.floor(total / 1000) % 60;
+  const m = Math.floor(total / 60000) % 60;
+  const h = Math.floor(total / 3600000);
+  const p = (n, w) => String(n).padStart(w, '0');
+  return `${p(h, 2)}:${p(m, 2)}:${p(s, 2)}.${p(ms, 3)}`;
+}
+
+function shiftSubtitle(body, offsetMs) {
+  // Strip BOM — a leading U+FEFF stops "WEBVTT" from matching and the whole
+  // file is rejected as malformed.
+  let text = body.replace(/^﻿/, '').replace(/\r\n/g, '\n');
+
+  // X-TIMESTAMP-MAP re-bases cues against an MPEG-TS PTS. We're emitting a
+  // standalone sideloaded file, so leaving it in would double-apply an offset.
+  text = text.replace(/^X-TIMESTAMP-MAP.*$/gim, '');
+
+  const shifted = text.replace(
+    /(\d{1,3}:)?(\d{1,2}):(\d{1,2})[.,](\d{1,3})(\s*-->\s*)(\d{1,3}:)?(\d{1,2}):(\d{1,2})[.,](\d{1,3})/g,
+    (_m, h1, m1, s1, ms1, arrow, h2, m2, s2, ms2) => {
+      const a = msToCue(cueToMs(h1 && h1.slice(0, -1), m1, s1, ms1) + offsetMs);
+      const b = msToCue(cueToMs(h2 && h2.slice(0, -1), m2, s2, ms2) + offsetMs);
+      return `${a} --> ${b}`;
+    });
+
+  // SubRip has no WEBVTT header and numbers each cue. Dropping the bare index
+  // lines and prepending the header is all that separates the two formats once
+  // the comma separators are already normalised above.
+  if (!/^WEBVTT/.test(shifted.trimStart())) {
+    // `[ \t]*` rather than `\s*`: \s matches newlines, so a greedy version
+    // swallows the blank line that separates cues. WebVTT treats a cue as
+    // running until the next blank line, so losing it merges every cue into
+    // one block and the subtitles render as a single wall of text.
+    const cues = shifted.replace(/^[ \t]*\d+[ \t]*\r?\n(?=\d{1,3}:\d{2})/gm, '');
+    return 'WEBVTT\n\n' + cues.trimStart();
+  }
+  return shifted;
+}
+
+async function handleSubtitle(request, url) {
+  const upstream = url.searchParams.get('url');
+  if (!upstream) {
+    return new Response(JSON.stringify({ error: 'need ?url=' }), { status: 400, headers: CORS_HEADERS });
+  }
+  const offsetMs = Number(url.searchParams.get('offset') || 0) || 0;
+  const referer = url.searchParams.get('referer') || SPOOF_ORIGIN + '/';
+
+  const subHeaders = {
+    'Accept': '*/*',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Referer': referer,
+  };
+  try { subHeaders['Origin'] = new URL(referer).origin; } catch (e) { /* referer may be bare */ }
+
+  let res;
+  try {
+    res = await fetch(upstream, { headers: subHeaders, cf: { cacheEverything: true, cacheTtl: 86400 } });
+  } catch (e) {
+    return new Response(JSON.stringify({ error: 'subtitle fetch failed: ' + (e.message || e) }), {
+      status: 502, headers: CORS_HEADERS
+    });
+  }
+  if (!res.ok) {
+    return new Response(JSON.stringify({ error: `subtitle HTTP ${res.status}` }), {
+      status: res.status, headers: CORS_HEADERS
+    });
+  }
+
+  const out = shiftSubtitle(await res.text(), offsetMs);
+  return new Response(out, {
+    status: 200,
+    headers: {
+      'Access-Control-Allow-Origin': '*',
+      'Content-Type': 'text/vtt; charset=utf-8',
+      'Cache-Control': 'public, max-age=86400',
+      'X-Sub-Offset': String(offsetMs),
+    }
+  });
+}
+
 // ─── Router ──────────────────────────────────────────────────────────────────
 export default {
   async fetch(request, env, ctx) {
@@ -1294,6 +1393,7 @@ export default {
     if (request.method === 'OPTIONS') return new Response(null, { headers: CORS_HEADERS });
 
     if (url.pathname === '/hls-proxy') return handleHlsProxy(request, url, env, ctx);
+    if (url.pathname === '/sub') return handleSubtitle(request, url);
     if (url.pathname === '/playlist-host' || url.pathname.startsWith('/playlist-host/')) {
       return handleHostedPlaylist(request, url, env, ctx);
     }
